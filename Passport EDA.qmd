@@ -43,7 +43,8 @@ show_summary = (
     .groupby("Series_Title", as_index=False)
     .agg(
         Outreach=("UID", "nunique"),
-        total_watch_time_seconds=("Time.Watched", "sum")
+        total_watch_time_seconds=("Time.Watched", "sum"),
+        avg_show_completion=("Percent.Watched", "mean")
     )
 )
 
