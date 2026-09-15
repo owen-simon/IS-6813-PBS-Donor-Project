@@ -1,5 +1,5 @@
 ---
-title: "Passport Viewing Data: EDA"
+title: "EDA"
 author: "Owen Simon"
 format: 
     html:
@@ -23,19 +23,20 @@ from IPython.display import HTML
 ```{python}
 # load passport viewing data
 passport = pd.read_csv("Data_Files/passport_viewing_data.csv")
+```
 
-# rename columns
+
+## Passport Content Popularity
+
+```{python}
+# Rename passport title columns
 passport = passport.rename(columns={
     "Content.Channel": "Series_Title",
     "Title": "Episode_Title",
     }
 )
-```
 
-## Series Popularity
-
-```{python}
-# calculate total number of unique passport accounts
+# Calculate total number of unique passport accounts
 total_accounts = passport["UID"].nunique()
 
 show_summary = (
@@ -44,7 +45,7 @@ show_summary = (
     .agg(
         Outreach=("UID", "nunique"),
         total_watch_time_seconds=("Time.Watched", "sum"),
-        avg_show_completion=("Percent.Watched", "mean")
+        Avg_Show_Completion=("Percent.Watched", "mean")
     )
 )
 
@@ -58,6 +59,7 @@ show_summary["Watch Time (Hrs)"] = (
     round((show_summary["total_watch_time_seconds"] / 3600), 2)
 )
 
+# Drop `total_watch_time_seconds`
 show_summary = show_summary.drop(columns=['total_watch_time_seconds'])
 
 # Sort by outreach, highest first
@@ -76,7 +78,8 @@ show_summary[
             "Series_Title",
             "Outreach",
             "Outreach (%)",
-            "Watch Time (Hrs)"
+            "Watch Time (Hrs)",
+            "Avg_Show_Completion"
         ]
     ]
 
