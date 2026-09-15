@@ -35,7 +35,9 @@ passport = passport.rename(columns={
     "Title": "Episode_Title",
     }
 )
+```
 
+```{python}
 # Calculate total number of unique passport accounts
 total_accounts = passport["UID"].nunique()
 
@@ -43,15 +45,15 @@ show_summary = (
     passport
     .groupby("Series_Title", as_index=False)
     .agg(
-        Outreach=("UID", "nunique"),
+        Reach=("UID", "nunique"),
         total_watch_time_seconds=("Time.Watched", "sum"),
-        Avg_Show_Completion=("Percent.Watched", "mean")
+        Avg_Show_Completion_Pct=("Percent.Watched", "mean")
     )
 )
 
 # Calculate percent of all accounts that watched each show
-show_summary["Outreach (%)"] = (
-    show_summary["Outreach"] / total_accounts * 100
+show_summary["Reach (%)"] = (
+    show_summary["Reach"] / total_accounts * 100
 )
 
 # Convert total watch time to hours
@@ -61,27 +63,25 @@ show_summary["Watch Time (Hrs)"] = (
 
 # Drop `total_watch_time_seconds`
 show_summary = show_summary.drop(columns=['total_watch_time_seconds'])
+```
 
-# Sort by outreach, highest first
+```{python}
+# Sort by `Reach` and `Watch Time (Hrs)`
 show_summary = (
     show_summary
     .sort_values(
-        ["Outreach", "Watch Time (Hrs)"],
+        ["Reach", "Watch Time (Hrs)"],
         ascending=[False, False]
     )
     .reset_index(drop=True)
 )
 
 # Set column order
-show_summary[
-        [
-            "Series_Title",
-            "Outreach",
-            "Outreach (%)",
-            "Watch Time (Hrs)",
-            "Avg_Show_Completion"
-        ]
-    ]
+new_order = ["Series_Title", "Reach", "Reach (%)", "Watch Time (Hrs)", "Avg_Show_Completion_Pct"]
+show_summary = show_summary.reindex(columns=new_order)
+
 
 display(HTML(show_summary.to_html(index=False)))
 ```
+
+**Recommendation:** Shows that are still in production with less than 50% reach should be cancelled.
