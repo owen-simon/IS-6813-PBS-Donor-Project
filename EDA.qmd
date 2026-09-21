@@ -18,13 +18,116 @@ execute:
 import pandas as pd
 from IPython.display import display
 from IPython.display import HTML
+import geopandas as gpd
+import matplotlib.pyplot as plt
 ```
 
 ```{python}
 # load passport viewing data
+memberships = pd.read_csv(
+    "Data_Files/constituents_w_memberships.csv", 
+    dtype={"UofU Employment Status": "string"})
 passport = pd.read_csv("Data_Files/passport_viewing_data.csv")
 ```
 
+## Membership Data
+
+```{python}
+print(memberships.describe())
+```
+
+```{python}
+# Select relevant columns
+constituent_locations = memberships[
+    ["Constituent ID", "Address ZIP"]
+].copy()
+
+# Clean ZIP codes
+constituent_locations["Address ZIP"] = (
+    constituent_locations["Address ZIP"]
+    .astype("string")
+    .str.strip()
+    .str.extract(r"(\d{5})", expand=False)
+)
+
+# Remove missing ZIP codes
+constituent_locations = constituent_locations.dropna(
+    subset=["Address ZIP"]
+)
+
+# Count unique constituents by ZIP
+zip_counts = (
+    constituent_locations
+    .groupby("Address ZIP")
+    ["Constituent ID"]
+    .nunique()
+    .reset_index(name="Constituent Count")
+    .sort_values("Constituent Count", ascending=False)
+)
+
+display(zip_counts.head())
+```
+
+```{python}
+print(f"Total constituents: {memberships['Constituent ID'].nunique():,}")
+
+print(
+    f"Constituents with ZIP codes: "
+    f"{constituent_locations['Constituent ID'].nunique():,}"
+)
+
+print(f"Unique ZIP codes: {constituent_locations['Address ZIP'].nunique():,}")
+```
+
+```{python}
+zcta_url = (
+    "https://www2.census.gov/geo/tiger/TIGER2025/ZCTA520/"
+    "tl_2025_us_zcta520.zip"
+)
+
+zctas = gpd.read_file(zcta_url)
+
+display(zctas.head())
+```
+
+```{python}
+constituent_map = zctas.merge(
+    zip_counts,
+    left_on="ZCTA5CE20",
+    right_on="Address ZIP",
+    how="inner"
+)
+
+display(
+    constituent_map[
+        ["ZCTA5CE20", "Constituent Count"]
+    ].head()
+)
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(12, 10))
+
+constituent_map.plot(
+    column="Constituent Count",
+    cmap="Blues",
+    linewidth=0.2,
+    edgecolor="white",
+    legend=True,
+    ax=ax
+)
+
+ax.set_title(
+    "Geographic Distribution of Constituents by ZIP Code",
+    fontsize=16,
+    fontweight="bold"
+)
+
+ax.axis("off")
+
+plt.tight_layout()
+plt.show()
+```
 
 ## Passport Viewing Data
 
@@ -83,5 +186,3 @@ show_summary = show_summary.reindex(columns=new_order)
 
 display(HTML(show_summary.to_html(index=False)))
 ```
-
-**Recommendation:** Shows that are still in production with less than 50% reach should be cancelled.
