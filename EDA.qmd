@@ -1,188 +1,329 @@
----
-title: "EDA"
-author: "Owen Simon"
-format: 
-    html:
-        toc: true
-        toc-depth: 3
-        toc-location: left
-        toc-title: "Table of Contents"
-        embed-resources: true
-execute:
-  echo: false
----
+### Geographic Coverage
 
-## Setup
+```{r}
+library(dplyr)
+library(readr)
+library(stringr)
+library(sf)
+library(ggplot2)
+library(tigris)
 
-```{python}
-import pandas as pd
-from IPython.display import display
-from IPython.display import HTML
-import geopandas as gpd
-import matplotlib.pyplot as plt
+options(tigris_use_cache = TRUE)
 ```
 
-```{python}
-# load passport viewing data
-memberships = pd.read_csv(
-    "Data_Files/constituents_w_memberships.csv", 
-    dtype={"UofU Employment Status": "string"})
-passport = pd.read_csv("Data_Files/passport_viewing_data.csv")
-```
-
-## Membership Data
-
-```{python}
-print(memberships.describe())
-```
-
-```{python}
-# Select relevant columns
-constituent_locations = memberships[
-    ["Constituent ID", "Address ZIP"]
-].copy()
-
-# Clean ZIP codes
-constituent_locations["Address ZIP"] = (
-    constituent_locations["Address ZIP"]
-    .astype("string")
-    .str.strip()
-    .str.extract(r"(\d{5})", expand=False)
+```{r}
+# Load membership data
+memberships_map <- read_csv(
+  "Data_Files/constituents_w_memberships.csv",
+  show_col_types = FALSE
 )
 
-# Remove missing ZIP codes
-constituent_locations = constituent_locations.dropna(
-    subset=["Address ZIP"]
-)
+# Select and clean ZIP-code data
+constituent_locations <- memberships_map %>%
+  select(`Constituent ID`, `Address ZIP`) %>%
+  mutate(
+    `Address ZIP` = as.character(`Address ZIP`),
+    `Address ZIP` = str_extract(`Address ZIP`, "\\d{5}")
+  ) %>%
+  filter(!is.na(`Address ZIP`))
 
-# Count unique constituents by ZIP
-zip_counts = (
-    constituent_locations
-    .groupby("Address ZIP")
-    ["Constituent ID"]
-    .nunique()
-    .reset_index(name="Constituent Count")
-    .sort_values("Constituent Count", ascending=False)
-)
+# Count unique constituents by ZIP code
+zip_counts <- constituent_locations %>%
+  group_by(`Address ZIP`) %>%
+  summarise(
+    `Constituent Count` = n_distinct(`Constituent ID`),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(`Constituent Count`))
 
-display(zip_counts.head())
+head(zip_counts)
 ```
 
-```{python}
-print(f"Total constituents: {memberships['Constituent ID'].nunique():,}")
+### Geographic Summary
 
-print(
-    f"Constituents with ZIP codes: "
-    f"{constituent_locations['Constituent ID'].nunique():,}"
+```{r}
+# Total number of constituents
+total_constituents <- memberships_map %>%
+  summarise(
+    n = n_distinct(`Constituent ID`)
+  ) %>%
+  pull(n)
+
+# Constituents with valid ZIP codes
+constituents_with_zip <- constituent_locations %>%
+  summarise(
+    n = n_distinct(`Constituent ID`)
+  ) %>%
+  pull(n)
+
+# Number of unique ZIP codes
+unique_zip_codes <- n_distinct(
+  constituent_locations$`Address ZIP`
 )
 
-print(f"Unique ZIP codes: {constituent_locations['Address ZIP'].nunique():,}")
-```
+# ZIP-code coverage
+zip_coverage <- (
+  constituents_with_zip / total_constituents
+) * 100
 
-```{python}
-zcta_url = (
-    "https://www2.census.gov/geo/tiger/TIGER2025/ZCTA520/"
-    "tl_2025_us_zcta520.zip"
+cat(
+  "Total constituents:",
+  format(total_constituents, big.mark = ","),
+  "\n"
 )
 
-zctas = gpd.read_file(zcta_url)
+cat(
+  "Constituents with ZIP codes:",
+  format(constituents_with_zip, big.mark = ","),
+  "\n"
+)
 
-display(zctas.head())
+cat(
+  "ZIP coverage:",
+  round(zip_coverage, 1),
+  "%\n"
+)
+
+cat(
+  "Unique ZIP codes:",
+  format(unique_zip_codes, big.mark = ","),
+  "\n"
+)
 ```
 
-```{python}
-constituent_map = zctas.merge(
+### Utah Constituent Map
+
+```{r}
+# Download 2020 U.S. ZIP Code Tabulation Areas
+us_zctas <- zctas(
+  year = 2020,
+  cb = TRUE
+)
+
+# Download Utah state boundary
+utah_boundary <- states(
+  cb = TRUE,
+  year = 2020
+) %>%
+  filter(STUSPS == "UT")
+
+# Make sure both layers use the same coordinate system
+utah_boundary <- st_transform(
+  utah_boundary,
+  st_crs(us_zctas)
+)
+
+# Identify ZCTAs that intersect Utah
+utah_zctas <- us_zctas[
+  lengths(
+    st_intersects(
+      us_zctas,
+      utah_boundary
+    )
+  ) > 0,
+]
+
+cat(
+  "Utah ZIP Code Tabulation Areas:",
+  nrow(utah_zctas),
+  "\n"
+)
+```
+
+```{r}
+# Merge constituent counts with Utah ZIP boundaries
+utah_constituent_map <- utah_zctas %>%
+  left_join(
     zip_counts,
-    left_on="ZCTA5CE20",
-    right_on="Address ZIP",
-    how="inner"
+    by = c("ZCTA5CE20" = "Address ZIP")
+  )
+
+# Keep ZIP codes containing constituents
+matched_utah_zips <- utah_constituent_map %>%
+  filter(!is.na(`Constituent Count`))
+
+# Calculate number of constituents represented
+utah_constituents <- sum(
+  matched_utah_zips$`Constituent Count`,
+  na.rm = TRUE
 )
 
-display(
-    constituent_map[
-        ["ZCTA5CE20", "Constituent Count"]
-    ].head()
+cat(
+  "Utah ZIP codes with constituents:",
+  nrow(matched_utah_zips),
+  "\n"
+)
+
+cat(
+  "Utah constituents represented on map:",
+  format(
+    utah_constituents,
+    big.mark = ","
+  ),
+  "\n"
+)
+
+cat(
+  "Percent of all constituents represented in Utah:",
+  round(
+    utah_constituents / total_constituents * 100,
+    1
+  ),
+  "%\n"
 )
 ```
 
-```{python}
-fig, ax = plt.subplots(figsize=(12, 10))
-
-constituent_map.plot(
-    column="Constituent Count",
-    cmap="Blues",
-    linewidth=0.2,
-    edgecolor="white",
-    legend=True,
-    ax=ax
-)
-
-ax.set_title(
-    "Geographic Distribution of Constituents by ZIP Code",
-    fontsize=16,
-    fontweight="bold"
-)
-
-ax.axis("off")
-
-plt.tight_layout()
-plt.show()
+```{r}
+# Plot Utah constituent distribution
+ggplot() +
+  geom_sf(
+    data = utah_constituent_map,
+    aes(fill = `Constituent Count`),
+    color = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_gradient(
+    low = "lightblue",
+    high = "darkblue",
+    na.value = "grey95",
+    name = "Constituent Count"
+  ) +
+  geom_sf(
+    data = utah_boundary,
+    fill = NA,
+    color = "black",
+    linewidth = 0.5
+  ) +
+  labs(
+    title = "Geographic Distribution of PBS Utah Constituents",
+    subtitle = "Unique constituents by ZIP Code"
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(
+      size = 16,
+      face = "bold",
+      hjust = 0.5
+    ),
+    plot.subtitle = element_text(
+      size = 11,
+      hjust = 0.5
+    ),
+    legend.position = "right"
+  )
 ```
 
 ## Passport Viewing Data
 
-```{python}
-# Rename passport title columns
-passport = passport.rename(columns={
-    "Content.Channel": "Series_Title",
-    "Title": "Episode_Title",
-    }
+### Load Data
+
+```{r}
+# Load Passport viewing data
+passport <- read_csv(
+  "Data_Files/passport_viewing_data.csv",
+  show_col_types = FALSE
 )
 ```
 
-```{python}
-# Calculate total number of unique passport accounts
-total_accounts = passport["UID"].nunique()
+### Data Overview
 
-show_summary = (
-    passport
-    .groupby("Series_Title", as_index=False)
-    .agg(
-        Reach=("UID", "nunique"),
-        total_watch_time_seconds=("Time.Watched", "sum"),
-        Avg_Show_Completion_Pct=("Percent.Watched", "mean")
-    )
+```{r}
+cat(
+  "Viewing records:",
+  format(nrow(passport), big.mark = ","),
+  "\n"
 )
 
-# Calculate percent of all accounts that watched each show
-show_summary["Reach (%)"] = (
-    show_summary["Reach"] / total_accounts * 100
+cat(
+  "Unique Passport accounts:",
+  format(
+    n_distinct(passport$UID),
+    big.mark = ","
+  ),
+  "\n"
 )
 
-# Convert total watch time to hours
-show_summary["Watch Time (Hrs)"] = (
-    round((show_summary["total_watch_time_seconds"] / 3600), 2)
+cat(
+  "Unique constituents:",
+  format(
+    n_distinct(passport$`Constituent.ID`),
+    big.mark = ","
+  ),
+  "\n"
 )
 
-# Drop `total_watch_time_seconds`
-show_summary = show_summary.drop(columns=['total_watch_time_seconds'])
+cat(
+  "Unique series:",
+  format(
+    n_distinct(passport$`Content.Channel`),
+    big.mark = ","
+  ),
+  "\n"
+)
 ```
 
-```{python}
-# Sort by `Reach` and `Watch Time (Hrs)`
-show_summary = (
-    show_summary
-    .sort_values(
-        ["Reach", "Watch Time (Hrs)"],
-        ascending=[False, False]
+### Clean Data
+
+```{r}
+# Rename Passport title columns
+passport <- passport %>%
+  rename(
+    Series_Title = `Content.Channel`,
+    Episode_Title = Title
+  )
+```
+
+### Series Reach and Viewing
+
+```{r}
+# Calculate total number of unique Passport accounts
+total_accounts <- n_distinct(passport$UID)
+
+# Aggregate viewing activity by series
+show_summary <- passport %>%
+  group_by(Series_Title) %>%
+  summarise(
+    Reach = n_distinct(UID),
+    total_watch_time_seconds = sum(
+      `Time.Watched`,
+      na.rm = TRUE
+    ),
+    `Avg. Completion (%)` = mean(
+      `Percent.Watched`,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    `Reach (%)` = round(
+      Reach / total_accounts * 100,
+      2
+    ),
+    `Watch Time (Hrs)` = round(
+      total_watch_time_seconds / 3600,
+      2
+    ),
+    `Avg. Completion (%)` = round(
+      `Avg. Completion (%)`,
+      2
     )
-    .reset_index(drop=True)
-)
+  ) %>%
+  select(
+    Series_Title,
+    Reach,
+    `Reach (%)`,
+    `Watch Time (Hrs)`,
+    `Avg. Completion (%)`
+  ) %>%
+  arrange(
+    desc(Reach),
+    desc(`Watch Time (Hrs)`)
+  )
+```
 
-# Set column order
-new_order = ["Series_Title", "Reach", "Reach (%)", "Watch Time (Hrs)", "Avg_Show_Completion_Pct"]
-show_summary = show_summary.reindex(columns=new_order)
+### Series Summary
 
-
-display(HTML(show_summary.to_html(index=False)))
+```{r}
+# Display full series summary
+show_summary
 ```
