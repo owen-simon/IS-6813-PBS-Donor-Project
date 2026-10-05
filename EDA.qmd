@@ -1,468 +1,374 @@
 ---
-title: "PBS Utah: EDA"
+title: "PBS Utah Donor Project: Exploratory Data Analysis"
 author: "Owen Simon"
-
 format:
   html:
     toc: true
     toc-depth: 3
     toc-location: left
-    toc-title: "Table of Contents"
     embed-resources: true
-
 execute:
   message: false
   warning: false
 ---
 
+## Codex Session
+
+codex resume 01a10e2e-1a08-7650-949e-773c161f08e8
+
+## Purpose and approach
+
+This report provides reproducible exploratory data analysis for the synthetic PBS Utah donor release. It documents file grain, data quality, distributions, time coverage, and relationships before feature engineering or modeling. All findings describe synthetic data only.
+
+The source files are large. Each section loads one file, saves only small summaries, and removes the raw object before the next section. This makes rendering practical without keeping all nine files in memory.
+
 ## Setup
 
 ```{r}
+# Load only packages required to import, summarize, and plot the project data.
 library(dplyr)
 library(gt)
-library(readr)
-library(stringr)
-library(sf)
 library(ggplot2)
-library(tigris)
+library(knitr)
+library(readr)
+library(tibble)
 
-options(tigris_use_cache = TRUE)
+# Use one relative path so the report can run from the project root.
+data_dir <- "Data_Files"
+
+# Read a data file quietly and consistently.
+read_project_csv <- function(file_name) {
+  read_csv(file.path(data_dir, file_name), show_col_types = FALSE, progress = FALSE)
+}
+
+# Calculate PBS fiscal year, where July--December belong to the next fiscal year.
+fiscal_year <- function(date) {
+  as.integer(format(date, "%Y")) + as.integer(format(date, "%m") >= 7)
+}
+
+# Summarize a table without printing or retaining its raw records.
+profile_data <- function(data, file_name, key = NULL) {
+  key_missing <- key_duplicates <- NA_integer_
+  if (!is.null(key) && key %in% names(data)) {
+    values <- data[[key]]
+    key_missing <- sum(is.na(values) | values == "")
+    key_duplicates <- sum(duplicated(values[!is.na(values) & values != ""]))
+  }
+  tibble(file = file_name, rows = nrow(data), columns = ncol(data),
+         key = key,
+         missing_key_values = key_missing, duplicate_nonmissing_keys = key_duplicates)
+}
+
+# Report blank strings and missing values for each field.
+missingness <- function(data) {
+  tibble(field = names(data),
+         missing_n = vapply(data, function(x) sum(is.na(x) | x == ""), integer(1))) %>%
+    mutate(missing_pct = round(100 * missing_n / nrow(data), 2)) %>%
+    arrange(desc(missing_pct), desc(missing_n))
+}
+
+# Render compact summary tables with readable numbers.
+show_table <- function(x) kable(x, format = "html", digits = 2,
+                                format.args = list(big.mark = ","))
 ```
 
-## Constituent Data
+## Data inventory
 
-### Load Data
-
-```{r}
-# Load membership data
-memberships <- read_csv(
-  "Data_Files/constituents_w_memberships.csv",
-  show_col_types = FALSE
-)
-
-team_approach <- read_csv(
-  "Data_Files/team_approach_legacy_payments.csv",
-  show_col_types = FALSE
-)
-```
+The table grain is essential context for joins. A constituent, payment, legacy household gift, solicitation, soft credit, cultivation assignment, and viewing record are not interchangeable units.
 
 ```{r}
-# Select unique `Constituent_ID` and `Zipcode` from Constituents (Membership) data
-membership_locations <- memberships %>%
-  select(
-    `Constituent ID`,
-    `Address ZIP`
-  ) %>%
-  rename(
-    Constituent_ID = `Constituent ID`,
-    Zipcode = `Address ZIP`
-  ) %>%
-  mutate(
-    Constituent_ID = as.character(Constituent_ID),
-    Zipcode = as.character(Zipcode),
-    Zipcode = str_extract(Zipcode, "\\d{5}")
-  ) %>%
-  filter(
-    !is.na(Constituent_ID),
-    !is.na(Zipcode)
-  ) %>%
-  distinct(
-    Constituent_ID,
-    Zipcode
-  )
-```
-
-```{r}
-# Select unique `Constituent_ID` and `Zipcode` from Team Approach data
-team_approach_locations <- team_approach %>%
-  select(
-    constituent_id_1,
-    zip
-  ) %>%
-  rename(
-    Constituent_ID = constituent_id_1,
-    Zipcode = zip
-  ) %>%
-  mutate(
-    Constituent_ID = as.character(Constituent_ID),
-    Zipcode = as.character(Zipcode),
-    Zipcode = str_extract(Zipcode, "\\d{5}")
-  ) %>%
-  filter(
-    !is.na(Constituent_ID),
-    !is.na(Zipcode)
-  ) %>%
-  distinct(
-    Constituent_ID,
-    Zipcode
-  )
-```
-
-```{r}
-#---------------------------------------------------------------------
-# Merge membership and legacy zipcode information into singular df
-# Give current membership zipcodes priority over legacy ZIP codes
-# Combine both sources
-#---------------------------------------------------------------------
-membership_locations <- membership_locations %>%
-  mutate(Source = "Membership")
-
-team_approach_locations <- team_approach_locations %>%
-  mutate(Source = "Team Approach")
-
-constituent_locations <- bind_rows(
-  membership_locations,
-  team_approach_locations
+# Document all expected inputs and verify that they are present in the repository.
+inventory <- tribble(
+  ~file, ~grain, ~documented_key,
+  "constituents_w_memberships.csv", "constituent", "Constituent ID",
+  "unite_payments.csv", "payment", "payment_id",
+  "team_approach_legacy_payments.csv", "legacy household gift", "ta_account_id",
+  "soft_credits.csv", "soft credit", "Credit ID",
+  "campaign_codes.csv", "marketing code reference", "Marketing Code",
+  "campaign_members.csv", "solicitation", "none documented",
+  "cultivation.csv", "constituent-year assignment", "synthetic_id plus fiscal_year",
+  "officer_portfolios.csv", "portfolio", "portfolio_id",
+  "passport_viewing.csv", "viewing record", "UID"
 ) %>%
-  arrange(
-    Constituent_ID,
-    factor(
-      Source,
-      levels = c(
-        "Membership",
-        "Team Approach"
-      )
-    )
-  ) %>%
-  distinct(
-    Constituent_ID,
-    .keep_all = TRUE
-  )
+  mutate(available = file.exists(file.path(data_dir, file)),
+         bytes = if_else(available, file.info(file.path(data_dir, file))$size, NA_real_))
+
+gt(inventory) |>
+  tab_header(
+    title = "Data File Library")
 ```
 
-### Geographic Summary
+## Constituents and memberships
+
+This entity table supplies donor attributes. First check the documented identifier, missingness, demographic distributions, and current membership attributes. Current snapshot variables must not be used as historical values.
 
 ```{r}
-# Summary of combined geographic data
-membership_count <- n_distinct(
-  membership_locations$Constituent_ID
-)
+# Load the entity table and create only summaries needed for the report.
+constituents <- read_project_csv("constituents_w_memberships.csv")
 
-cat(
-  "Membership constituents with zipcodes:",
-  format(membership_count, big.mark = ","),
-  "\n"
-)
+constituent_profile <- profile_data(constituents, "constituents_w_memberships.csv", "Constituent ID")
 
-team_approach_count <- n_distinct(
-  team_approach_locations$Constituent_ID
-)
+constituent_missing <- missingness(constituents)
 
-cat(
-  "Team Approach constituents with zipcodes:",
-  format(team_approach_count, big.mark = ","),
-  "\n"
-)
+constituent_summary <- constituents %>%
+  summarise(unique_ids = n_distinct(.data[["Constituent ID"]]),
+            median_age = median(Age, na.rm = TRUE),
+            sustainers = sum(.data[["Sustainer PBS Utah"]], na.rm = TRUE),
+            sustainer_pct = 100 * mean(.data[["Sustainer PBS Utah"]], na.rm = TRUE))
 
-total_locations <- n_distinct(
-  constituent_locations$Constituent_ID
-)
-
-
-cat(
-  "Combined unique constituents with zipcodes:",
-  format(total_locations, big.mark = ","),
-  "\n"
-)
-
-unique_zipcodes <- n_distinct(
-  constituent_locations$Zipcode
-)
-
-cat(
-  "Unique ZIP codes:",
-  format(unique_zipcodes, big.mark = ","),
-  "\n"
-)
-```
-
-### Count Constituents by Zipcode
-
-```{r}
-# Count unique constituents by Zipcode
-zip_counts <- constituent_locations %>%
-  group_by(Zipcode) %>%
-  summarise(
-    `Constituent Count` = n_distinct(Constituent_ID),
-    .groups = "drop"
-  ) %>%
-  arrange(
-    desc(`Constituent Count`)
-  )
-
-gt(head(zip_counts, 10))
-```
-
-### Utah Constituent Map
-
-```{r}
-# Download 2020 U.S. ZIP Code Tabulation Areas
-us_zctas <- zctas(
-  year = 2020,
-  cb = TRUE
-)
-
-# Download Utah state boundary
-utah_boundary <- states(
-  cb = TRUE,
-  year = 2020
-) %>%
-  filter(STUSPS == "UT")
-
-# Make sure both layers use the same coordinate system
-utah_boundary <- st_transform(
-  utah_boundary,
-  st_crs(us_zctas)
-)
-
-# Identify ZCTAs that intersect Utah
-utah_zctas <- us_zctas[
-  lengths(
-    st_intersects(
-      us_zctas,
-      utah_boundary
-    )
-  ) > 0,
-]
-
-cat(
-  "Utah ZIP Code Tabulation Areas:",
-  nrow(utah_zctas),
-  "\n"
-)
+segments <- constituents %>%
+  count(.data[["Primary Constituent Type"]], Gender, .data[["Sustainer PBS Utah"]], sort = TRUE)
 ```
 
 ```{r}
-# Merge constituent counts with Utah ZIP boundaries
-utah_constituent_map <- utah_zctas %>%
-  left_join(
-    zip_counts,
-    by = c("ZCTA5CE20" = "Zipcode")
-  )
-
-# Keep ZIP codes containing constituents
-matched_utah_zips <- utah_constituent_map %>%
-  filter(!is.na(`Constituent Count`))
-
-# Calculate number of constituents represented in Utah
-utah_constituents <- sum(
-  matched_utah_zips$`Constituent Count`,
-  na.rm = TRUE
-)
-
-# Calculate percent of combined constituents represented in Utah
-utah_constituent_pct <- (
-  utah_constituents / total_locations
-) * 100
-
-cat(
-  "Utah ZIP codes with constituents:",
-  nrow(matched_utah_zips),
-  "\n"
-)
-
-cat(
-  "Utah constituents represented on map:",
-  format(
-    utah_constituents,
-    big.mark = ","
-  ),
-  "\n"
-)
-
-cat(
-  "Percent of combined constituents represented in Utah:",
-  round(
-    utah_constituent_pct,
-    1
-  ),
-  "%\n"
-)
+gt(constituent_profile)
 ```
 
 ```{r}
-# Plot Utah constituent distribution
-ggplot() +
-  geom_sf(
-    data = utah_constituent_map,
-    aes(fill = `Constituent Count`),
-    color = "white",
-    linewidth = 0.1
-  ) +
-  scale_fill_gradient(
-    low = "lightblue",
-    high = "darkblue",
-    na.value = "grey95",
-    name = "Constituent Count"
-  ) +
-  geom_sf(
-    data = utah_boundary,
-    fill = NA,
-    color = "black",
-    linewidth = 0.5
-  ) +
-  labs(
-    title = "Geographic Distribution of PBS Utah Constituents",
-    subtitle = "Unique Constituents by Zipcode"
-  ) +
-  theme_void() +
-  theme(
-    plot.title = element_text(
-      size = 16,
-      face = "bold",
-      hjust = 0.5
-    ),
-    plot.subtitle = element_text(
-      size = 11,
-      hjust = 0.5
-    ),
-    legend.position = "right"
-  )
+gt(constituent_summary)
 ```
 
 ```{r}
-#| echo: false
-# remove unnecessary items from memory
-rm(
-  constituent_locations,
-  matched_utah_zips,
-  membership_locations,
-  team_approach_locations,
-  us_zctas,
-  utah_boundary,
-  utah_constituent_map,
-  utah_zctas,
-  zip_counts,
-  membership_count,
-  team_approach_count,
-  total_locations,
-  unique_zipcodes,
-  memberships,
-  team_approach
-)
-```
-
-## Passport Viewing Data
-
-### Load Data
-
-```{r}
-# Load Passport viewing data
-passport <- read_csv(
-  "Data_Files/passport_viewing_data.csv",
-  show_col_types = FALSE
-)
-```
-
-### Data Overview
-
-```{r}
-cat(
-  "Viewing records:",
-  format(nrow(passport), big.mark = ","),
-  "\n"
-)
-
-cat(
-  "Unique Passport accounts:",
-  format(
-    n_distinct(passport$UID),
-    big.mark = ","
-  ),
-  "\n"
-)
-
-cat(
-  "Unique constituents:",
-  format(
-    n_distinct(passport$`Constituent.ID`),
-    big.mark = ","
-  ),
-  "\n"
-)
-
-cat(
-  "Unique series:",
-  format(
-    n_distinct(passport$`Content.Channel`),
-    big.mark = ","
-  ),
-  "\n"
-)
-```
-
-### Clean Data
-
-```{r}
-# Rename Passport title columns
-passport <- passport %>%
-  rename(
-    Series_Title = `Content.Channel`,
-    Episode_Title = Title
-  )
-```
-
-### Series Reach and Viewing
-
-```{r}
-# Calculate total number of unique Passport accounts
-total_accounts <- n_distinct(passport$UID)
-
-# Aggregate viewing activity by series
-show_summary <- passport %>%
-  group_by(Series_Title) %>%
-  summarise(
-    Reach = n_distinct(UID),
-    total_watch_time_seconds = sum(
-      `Time.Watched`,
-      na.rm = TRUE
-    ),
-    `Avg. Completion (%)` = mean(
-      `Percent.Watched`,
-      na.rm = TRUE
-    ),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    `Reach (%)` = round(
-      Reach / total_accounts * 100,
-      2
-    ),
-    `Watch Time (Hrs)` = round(
-      total_watch_time_seconds / 3600,
-      2
-    ),
-    `Avg. Completion (%)` = round(
-      100 * `Avg. Completion (%)`,
-      2
-    )
-  ) %>%
-  select(
-    Series_Title,
-    Reach,
-    `Reach (%)`,
-    `Watch Time (Hrs)`,
-    `Avg. Completion (%)`
-  ) %>%
-  arrange(
-    desc(Reach),
-    desc(`Watch Time (Hrs)`)
-  )
-```
-
-### Series Summary
-
-```{r}
-# Display full series summary
-gt(head(show_summary, 10))
+gt(head(constituent_missing, 12))
 ```
 
 ```{r}
-cat(
-  "<strong>Note:</strong> Only",
-  sum(show_summary$`Reach (%)` > 10, na.rm = TRUE),
-  "out of the",
-  n_distinct(passport$Series_Title),
-  "unique series on PBS Passport have been viewed by at least 10% of accounts."
-)
+gt(head(segments, 15))
 ```
+
+```{r}
+# Plot the age distribution only for records with known ages.
+ggplot(filter(constituents, !is.na(Age)), aes(Age)) +
+  geom_histogram(binwidth = 5, fill = "#2563A6", color = "white") +
+  labs(title = "Constituent age distribution", x = "Age", y = "Constituents") +
+  theme_minimal()
+
+# Release large raw data before analyzing transactions.
+rm(constituents, constituent_profile, constituent_missing, constituent_summary, segments)
+gc()
+```
+
+## Unite payments
+
+Unite contains payment-level data beginning in FY2021. Examine key quality, invalid values, donor coverage, fiscal-year trend, and mix of gift and tender types. Revenue totals and transaction counts answer different questions and are both shown.
+
+```{r}
+# Parse the date explicitly before grouping payments into fiscal years.
+unite <- read_project_csv("unite_payments.csv") %>%
+  mutate(credit_date = as.Date(credit_date), 
+         fiscal_year = fiscal_year(credit_date))
+
+unite_profile <- profile_data(unite, "unite_payments.csv", "payment_id")
+
+unite_quality <- unite %>%
+  summarise(unique_donors = n_distinct(donor_id),
+            nonpositive_amounts = sum(is.na(payment_amount) | payment_amount <= 0),
+            missing_dates = sum(is.na(credit_date)),
+            first_date = min(credit_date, na.rm = TRUE), last_date = max(credit_date, na.rm = TRUE))
+
+unite_by_year <- unite %>%
+  group_by(fiscal_year) %>%
+  summarise(payments = n(), 
+            donors = n_distinct(donor_id), 
+            revenue = sum(payment_amount, na.rm = TRUE),
+            median_payment = median(payment_amount, na.rm = TRUE), .groups = "drop")
+
+unite_mix <- unite %>%
+  group_by(gift_type, tender_type) %>%
+  summarise(payments = n(), revenue = sum(payment_amount, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(revenue))
+```
+
+```{r}
+gt(unite_profile)
+```
+
+```{r}
+gt(unite_quality) |>
+  tab_header(
+    title = "Unite Data Quality")
+```
+
+```{r}
+gt(unite_by_year)
+```
+
+```{r}
+gt(head(unite_mix, 15))
+```
+
+
+
+```{r}
+# Plot annual revenue and investigate discontinuities before drawing conclusions.
+ggplot(unite_by_year, aes(factor(fiscal_year), revenue)) +
+  geom_col(fill = "#2563A6") +
+  scale_y_continuous(labels = function(x) paste0("$", format(x, big.mark = ",", trim = TRUE))) +
+  labs(title = "Unite payment revenue by fiscal year", x = "Fiscal year", y = "Revenue") +
+  theme_minimal()
+
+rm(unite, unite_profile, unite_quality, unite_by_year, unite_mix)
+gc()
+```
+
+## Legacy Team Approach payments
+
+Legacy records have household-gift grain and can link to several constituent IDs. Do not append their rows to Unite and call the result donor-level data. First inspect link availability, time range, values, and communication channels; later aggregate to an explicit donor-year rule.
+
+```{r}
+# Parse legacy dates and quantify constituent-link completeness.
+legacy <- read_project_csv("team_approach_legacy_payments.csv") %>%
+  mutate(gift_date = as.Date(gift_date), fiscal_year = fiscal_year(gift_date))
+legacy_quality <- legacy %>%
+  summarise(nonpositive_amounts = sum(is.na(payment_amount) | payment_amount <= 0),
+            missing_dates = sum(is.na(gift_date)),
+            first_constituent_link = sum(!is.na(constituent_id_1) & constituent_id_1 != ""),
+            no_constituent_link = sum(if_all(starts_with("constituent_id_"), ~ is.na(.x) | .x == "")))
+legacy_year <- legacy %>%
+  group_by(fiscal_year) %>%
+  summarise(gifts = n(), revenue = sum(payment_amount, na.rm = TRUE),
+            median_gift = median(payment_amount, na.rm = TRUE), .groups = "drop")
+legacy_channels <- legacy %>%
+  group_by(communication_method, communication_type) %>%
+  summarise(gifts = n(), revenue = sum(payment_amount, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(revenue))
+
+show_table(profile_data(legacy, "team_approach_legacy_payments.csv", "ta_account_id"))
+show_table(legacy_quality)
+show_table(tail(legacy_year, 12))
+show_table(head(legacy_channels, 15))
+
+rm(legacy, legacy_quality, legacy_year, legacy_channels)
+gc()
+```
+
+## Campaign codes and solicitation history
+
+Campaign codes are reference data; campaign members are solicitation records. The anti-join checks whether every solicitation points to a known code. Response rates are descriptive, not causal measures of campaign effectiveness.
+
+```{r}
+# Load both campaign tables only while their relationship is being tested.
+campaign_codes <- read_project_csv("campaign_codes.csv")
+campaign_members <- read_project_csv("campaign_members.csv") %>%
+  mutate(campaign_start_date = as.Date(campaign_start_date),
+         fiscal_year = fiscal_year(campaign_start_date))
+campaign_links <- campaign_members %>%
+  anti_join(select(campaign_codes, marketing_code = all_of("Marketing Code")), by = "marketing_code") %>%
+  summarise(unmatched_rows = n(), unmatched_codes = n_distinct(marketing_code))
+campaign_results <- campaign_members %>%
+  group_by(fiscal_year) %>%
+  summarise(solicitations = n(), constituents = n_distinct(constituent_id),
+            responses = sum(responded, na.rm = TRUE),
+            response_rate_pct = 100 * mean(responded, na.rm = TRUE), .groups = "drop")
+campaign_rank <- campaign_members %>%
+  group_by(marketing_code, campaign_name) %>%
+  summarise(solicitations = n(), responses = sum(responded, na.rm = TRUE),
+            response_rate_pct = 100 * mean(responded, na.rm = TRUE), .groups = "drop") %>%
+  filter(solicitations >= 30) %>% arrange(desc(response_rate_pct), desc(solicitations))
+
+show_table(profile_data(campaign_codes, "campaign_codes.csv", "Marketing Code"))
+show_table(profile_data(campaign_members, "campaign_members.csv"))
+show_table(campaign_links)
+show_table(campaign_results)
+show_table(head(campaign_rank, 20))
+
+rm(campaign_codes, campaign_members, campaign_links, campaign_results, campaign_rank)
+gc()
+```
+
+## Soft credits
+
+Soft credits are attributed recognition, rather than necessarily direct cash paid by the recipient. They should stay separate from payments until a later metric applies the documented duplicate-removal and attribution rules.
+
+```{r}
+# Examine unique credits, orphan recipients, amount validity, and organization type.
+soft <- read_project_csv("soft_credits.csv") %>%
+  mutate(credit_date = as.Date(.data[["Credit Date"]]), fiscal_year = fiscal_year(credit_date))
+soft_quality <- soft %>%
+  summarise(exact_duplicate_rows = sum(duplicated(soft)),
+            orphan_recipients = sum(.data[["Soft Credit Constituent ID"]] == "SYN-ORPHAN", na.rm = TRUE),
+            nonpositive_amounts = sum(is.na(.data[["Credit Amount"]]) | .data[["Credit Amount"]] <= 0),
+            first_date = min(credit_date, na.rm = TRUE), last_date = max(credit_date, na.rm = TRUE))
+soft_mix <- soft %>%
+  group_by(.data[["Hard Credit Org Type"]], .data[["Credit Gift Type"]]) %>%
+  summarise(credits = n(), amount = sum(.data[["Credit Amount"]], na.rm = TRUE),
+            median_amount = median(.data[["Credit Amount"]], na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(amount))
+
+show_table(profile_data(soft, "soft_credits.csv", "Credit ID"))
+show_table(soft_quality)
+show_table(soft_mix)
+
+rm(soft, soft_quality, soft_mix)
+gc()
+```
+
+## Cultivation assignments and officer portfolios
+
+Cultivation has constituent-year grain while portfolios are reference records. The following relationship check and funnel help assess capacity, selection, contact, and holdout patterns. Holdout comparisons require further validation before causal interpretation.
+
+```{r}
+# Join portfolio capacity to cultivation summaries and report unmatched assignments.
+portfolios <- read_project_csv("officer_portfolios.csv")
+cultivation <- read_project_csv("cultivation.csv")
+cultivation_links <- cultivation %>%
+  anti_join(portfolios, by = "portfolio_id") %>%
+  summarise(unmatched_rows = n(), unmatched_portfolios = n_distinct(portfolio_id))
+cultivation_funnel <- cultivation %>%
+  group_by(fiscal_year, portfolio_id) %>%
+  summarise(assignments = n(), selected = sum(selected, na.rm = TRUE),
+            contacted = sum(contacted, na.rm = TRUE), holdout = sum(holdout, na.rm = TRUE),
+            adopted = first(program_adopted), .groups = "drop") %>%
+  left_join(select(portfolios, portfolio_id, capacity, rollout_fy), by = "portfolio_id") %>%
+  mutate(selection_rate_pct = 100 * selected / assignments,
+         contact_rate_of_selected_pct = if_else(selected > 0, 100 * contacted / selected, NA_real_))
+
+show_table(profile_data(portfolios, "officer_portfolios.csv", "portfolio_id"))
+show_table(profile_data(cultivation, "cultivation.csv"))
+show_table(cultivation_links)
+show_table(cultivation_funnel)
+
+rm(portfolios, cultivation, cultivation_links, cultivation_funnel)
+gc()
+```
+
+## Passport viewing data
+
+The checked-in Passport file may be a Git LFS pointer rather than data. This chunk reports that condition cleanly. After retrieving the LFS object, it will profile account reach, viewing time, completion, content, and device distribution.
+
+```{r}
+# Verify that the file is data rather than a Git LFS pointer before importing it.
+passport_path <- file.path(data_dir, "passport_viewing.csv")
+first_line <- if (file.exists(passport_path)) read_lines(passport_path, n_max = 1) else ""
+passport_ready <- file.exists(passport_path) && first_line != "version https://git-lfs.github.com/spec/v1"
+
+if (!passport_ready) {
+  cat("Passport viewing data is unavailable locally. Run git lfs pull, then render again.\n")
+} else {
+  passport <- read_project_csv("passport_viewing.csv")
+  passport_summary <- passport %>%
+    summarise(records = n(), accounts = n_distinct(UID),
+              linked_constituents = n_distinct(.data[["Constituent.ID"]], na.rm = TRUE),
+              watch_hours = sum(.data[["Time.Watched"]], na.rm = TRUE) / 3600,
+              median_completion_pct = 100 * median(.data[["Percent.Watched"]], na.rm = TRUE))
+  passport_content <- passport %>%
+    group_by(.data[["Content.Channel"]], Genre) %>%
+    summarise(accounts = n_distinct(UID), watch_hours = sum(.data[["Time.Watched"]], na.rm = TRUE) / 3600,
+              mean_completion_pct = 100 * mean(.data[["Percent.Watched"]], na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(accounts), desc(watch_hours))
+  passport_devices <- passport %>% count(Device, sort = TRUE) %>% mutate(record_pct = 100 * n / sum(n))
+
+  show_table(profile_data(passport, "passport_viewing.csv", "UID"))
+  show_table(passport_summary)
+  show_table(head(passport_content, 20))
+  show_table(passport_devices)
+  rm(passport, passport_summary, passport_content, passport_devices)
+  gc()
+}
+```
+
+## EDA conclusions and next steps
+
+Read the resulting tables before building features. Resolve unexpected duplicate keys, broken links, non-positive amounts, and missing dates. Define a single fiscal-year giving outcome using the documented direct-payment and soft-credit rules. Aggregate every source to an explicit analysis grain before joining it. Treat response rates and cultivation comparisons as descriptive until eligibility, selection, timing, and holdout design are confirmed. Passport nonappearance does not prove no viewing or account access.
+
+These checks are intended to become automated validation tests in the feature-engineering workflow.

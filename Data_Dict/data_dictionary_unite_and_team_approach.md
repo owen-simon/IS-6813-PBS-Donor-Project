@@ -1,5 +1,10 @@
 # Dataset Data Dictionaries
 
+> **Schema note:** These reference descriptions do not establish that the
+> synthetic tables reproduce PBS Utah's actual or current table structure,
+> columns, keys, or relationships. Use the synthetic student dictionary for
+> release-specific conventions.
+
 constituents_w_memberships.csv
 
 unite_payments.csv
@@ -9,6 +14,8 @@ unite_giftpremiums.csv
 team_approach_legacy_payments.csv
 
 campaign_codes.csv
+
+campaign_members.csv
 
 constituents_w_acquisition_scores.csv
 
@@ -20,7 +27,7 @@ constituents_w_capacity_ratings.csv
 
 constituents_w_engagement_scores.csv
 
-passport_viewing_data.csv
+passport_viewing.csv
 
 Supplement 1: Campaign Codes / Marketing Codes / Source Codes
 
@@ -158,6 +165,30 @@ Supplement 2: Making Team Approach Play Nice with Unite
 | 15 | Campaign Description | Character |  | TRUE | Thousands, non-unique | Description of campaign, usually the same as the Campaign Name |
 | 16 | Gift Type | Character |  | TRUE | Lapsed/Rejoin \| Additional Gift \| Renewal \| New \| Upgrade Sustainer \| Donation \| Upgrade/Reset \| New Sustainer \| Matching Gift \| Upgrade | Gift type associated with campaign code |
 | 17 | Solicitation | Boolean |  | FALSE | TRUE, FALSE (1, 0) | Whether campaign was a solicitation or not |
+
+## campaign_members.csv
+
+This table describes campaign membership and solicitation response history.
+No unique row key is documented. The standalone source dictionary does not
+specify field nullability, so it is shown as "Not specified" below rather than
+inferred.
+
+| Order | Field Name | Data Type | Primary Key | Nullable | Values | Meaning |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | constituent_id | Integer |  | Not specified | Thousands, non-unique | Unite constituent ID also present in other related datasets. |
+| 2 | marketing_code | Character |  | Not specified | Thousands, non-unique | Marketing, campaign, or source code for the solicitation. The table includes constituents assigned to a campaign whether or not they responded. Also present in `campaign_codes.csv`. |
+| 3 | campaign_name | Character |  | Not specified | Thousands, non-unique | Name of the campaign associated with `marketing_code`. Also present in `campaign_codes.csv`. |
+| 4 | responded | Boolean |  | Not specified | TRUE, FALSE (1, 0) | Whether the constituent responded to the campaign by making a donation. |
+| 5 | response_type | Character |  | Not specified | Not specified | Response classification. The source dictionary notes that this field is likely not useful. |
+| 6 | indirect_response | Boolean |  | Not specified | TRUE, FALSE (1, 0) | Whether the constituent self-selected into the campaign rather than being directly solicited. This is often `TRUE` for general fiscal-year campaigns. |
+| 7 | responded_date | Date |  | Not specified | Thousands, non-unique | Recorded response date. The source dictionary warns that this field may be unreliable and recommends using the payment date for accurate timing. |
+| 8 | campaign_start_date | Date |  | Not specified | Thousands, non-unique | Recorded campaign start date. |
+
+The synthetic release uses additional conventions for this table, including a
+fabricated constituent ID, a fiscal-year marker for `campaign_start_date`, and
+derived response fields. Those conventions are documented in the student
+synthetic dictionary and should not be interpreted as PBS Utah production
+semantics.
 
 ## constituents_w_acquisition_scores.csv
 
@@ -310,6 +341,13 @@ Examples:
 - A Payment_Method of "Charge Card" (TA) is equivalent to "Credit Card" (Unite)
 
 - A Payment_Method of "Payroll Deduct" (TA) is equivalent to "Payroll Deduction" (Unite)
+
+- A Payment_Method of "Stock" (TA) = "Stock Gift" (Unite)
+
+- A Payment_Method of "Money Order" (TA) = "Check" (Unite)
+
+- A Pledge_Gift_Type of "Installment" can be changed to "Standard" for simplicity
+
 
 - A Payment_Method of "Stock" (TA) = "Stock Gift" (Unite)
 
