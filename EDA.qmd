@@ -125,7 +125,10 @@ gt(constituent_profile)
 ```
 
 ```{r}
-gt(constituent_summary)
+gt(constituent_summary) |>
+  tab_header(
+    title = ""
+  )
 ```
 
 ```{r}
