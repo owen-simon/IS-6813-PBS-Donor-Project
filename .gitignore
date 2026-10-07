@@ -23,8 +23,9 @@ Thumbs.db
 # Logs
 *.log
 
-# Data outputs
+# Data files
 *.csv
+passport_viewing.txt
 
 # Excel
 *.xlsx

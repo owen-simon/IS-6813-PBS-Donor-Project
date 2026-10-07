@@ -92,7 +92,9 @@ inventory <- tribble(
 ) %>%
   mutate(available = file.exists(file.path(data_dir, file)),
          bytes = if_else(available, file.info(file.path(data_dir, file))$size, NA_real_))
+```
 
+```{r}
 gt(inventory) |>
   tab_header(
     title = "Data File Library")
@@ -122,20 +124,12 @@ segments <- constituents %>%
 
 ```{r}
 gt(constituent_profile)
-```
-
-```{r}
 gt(constituent_summary) |>
   tab_header(
     title = ""
   )
-```
 
-```{r}
 gt(head(constituent_missing, 12))
-```
-
-```{r}
 gt(head(segments, 15))
 ```
 
@@ -145,7 +139,9 @@ ggplot(filter(constituents, !is.na(Age)), aes(Age)) +
   geom_histogram(binwidth = 5, fill = "#2563A6", color = "white") +
   labs(title = "Constituent age distribution", x = "Age", y = "Constituents") +
   theme_minimal()
+```
 
+```{R}
 # Release large raw data before analyzing transactions.
 rm(constituents, constituent_profile, constituent_missing, constituent_summary, segments)
 gc()
@@ -184,23 +180,13 @@ unite_mix <- unite %>%
 
 ```{r}
 gt(unite_profile)
-```
-
-```{r}
 gt(unite_quality) |>
   tab_header(
     title = "Unite Data Quality")
-```
 
-```{r}
 gt(unite_by_year)
-```
-
-```{r}
 gt(head(unite_mix, 15))
 ```
-
-
 
 ```{r}
 # Plot annual revenue and investigate discontinuities before drawing conclusions.
@@ -222,25 +208,32 @@ Legacy records have household-gift grain and can link to several constituent IDs
 # Parse legacy dates and quantify constituent-link completeness.
 legacy <- read_project_csv("team_approach_legacy_payments.csv") %>%
   mutate(gift_date = as.Date(gift_date), fiscal_year = fiscal_year(gift_date))
+
 legacy_quality <- legacy %>%
   summarise(nonpositive_amounts = sum(is.na(payment_amount) | payment_amount <= 0),
             missing_dates = sum(is.na(gift_date)),
             first_constituent_link = sum(!is.na(constituent_id_1) & constituent_id_1 != ""),
             no_constituent_link = sum(if_all(starts_with("constituent_id_"), ~ is.na(.x) | .x == "")))
+
 legacy_year <- legacy %>%
   group_by(fiscal_year) %>%
   summarise(gifts = n(), revenue = sum(payment_amount, na.rm = TRUE),
             median_gift = median(payment_amount, na.rm = TRUE), .groups = "drop")
+
 legacy_channels <- legacy %>%
   group_by(communication_method, communication_type) %>%
   summarise(gifts = n(), revenue = sum(payment_amount, na.rm = TRUE), .groups = "drop") %>%
   arrange(desc(revenue))
+```
 
-show_table(profile_data(legacy, "team_approach_legacy_payments.csv", "ta_account_id"))
-show_table(legacy_quality)
-show_table(tail(legacy_year, 12))
-show_table(head(legacy_channels, 15))
+```{r}
+gt(profile_data(legacy, "team_approach_legacy_payments.csv", "ta_account_id"))
+gt(legacy_quality)
+gt(tail(legacy_year, 12))
+gt(head(legacy_channels, 15))
+```
 
+```{r}
 rm(legacy, legacy_quality, legacy_year, legacy_channels)
 gc()
 ```
@@ -252,29 +245,37 @@ Campaign codes are reference data; campaign members are solicitation records. Th
 ```{r}
 # Load both campaign tables only while their relationship is being tested.
 campaign_codes <- read_project_csv("campaign_codes.csv")
+
 campaign_members <- read_project_csv("campaign_members.csv") %>%
   mutate(campaign_start_date = as.Date(campaign_start_date),
          fiscal_year = fiscal_year(campaign_start_date))
+
 campaign_links <- campaign_members %>%
   anti_join(select(campaign_codes, marketing_code = all_of("Marketing Code")), by = "marketing_code") %>%
   summarise(unmatched_rows = n(), unmatched_codes = n_distinct(marketing_code))
+
 campaign_results <- campaign_members %>%
   group_by(fiscal_year) %>%
   summarise(solicitations = n(), constituents = n_distinct(constituent_id),
             responses = sum(responded, na.rm = TRUE),
             response_rate_pct = 100 * mean(responded, na.rm = TRUE), .groups = "drop")
+
 campaign_rank <- campaign_members %>%
   group_by(marketing_code, campaign_name) %>%
   summarise(solicitations = n(), responses = sum(responded, na.rm = TRUE),
             response_rate_pct = 100 * mean(responded, na.rm = TRUE), .groups = "drop") %>%
   filter(solicitations >= 30) %>% arrange(desc(response_rate_pct), desc(solicitations))
+```
 
-show_table(profile_data(campaign_codes, "campaign_codes.csv", "Marketing Code"))
-show_table(profile_data(campaign_members, "campaign_members.csv"))
-show_table(campaign_links)
-show_table(campaign_results)
-show_table(head(campaign_rank, 20))
+```{r}
+gt(profile_data(campaign_codes, "campaign_codes.csv", "Marketing Code"))
+gt(profile_data(campaign_members, "campaign_members.csv"))
+gt(campaign_links)
+gt(campaign_results)
+gt(head(campaign_rank, 20))
+```
 
+```{r}
 rm(campaign_codes, campaign_members, campaign_links, campaign_results, campaign_rank)
 gc()
 ```
@@ -297,11 +298,15 @@ soft_mix <- soft %>%
   summarise(credits = n(), amount = sum(.data[["Credit Amount"]], na.rm = TRUE),
             median_amount = median(.data[["Credit Amount"]], na.rm = TRUE), .groups = "drop") %>%
   arrange(desc(amount))
+```
 
-show_table(profile_data(soft, "soft_credits.csv", "Credit ID"))
-show_table(soft_quality)
-show_table(soft_mix)
+```{r}
+gt(profile_data(soft, "soft_credits.csv", "Credit ID"))
+gt(soft_quality)
+gt(soft_mix)
+```
 
+```{r}
 rm(soft, soft_quality, soft_mix)
 gc()
 ```
@@ -313,10 +318,13 @@ Cultivation has constituent-year grain while portfolios are reference records. T
 ```{r}
 # Join portfolio capacity to cultivation summaries and report unmatched assignments.
 portfolios <- read_project_csv("officer_portfolios.csv")
+
 cultivation <- read_project_csv("cultivation.csv")
+
 cultivation_links <- cultivation %>%
   anti_join(portfolios, by = "portfolio_id") %>%
   summarise(unmatched_rows = n(), unmatched_portfolios = n_distinct(portfolio_id))
+
 cultivation_funnel <- cultivation %>%
   group_by(fiscal_year, portfolio_id) %>%
   summarise(assignments = n(), selected = sum(selected, na.rm = TRUE),
@@ -325,12 +333,16 @@ cultivation_funnel <- cultivation %>%
   left_join(select(portfolios, portfolio_id, capacity, rollout_fy), by = "portfolio_id") %>%
   mutate(selection_rate_pct = 100 * selected / assignments,
          contact_rate_of_selected_pct = if_else(selected > 0, 100 * contacted / selected, NA_real_))
+```
 
-show_table(profile_data(portfolios, "officer_portfolios.csv", "portfolio_id"))
-show_table(profile_data(cultivation, "cultivation.csv"))
-show_table(cultivation_links)
-show_table(cultivation_funnel)
+```{r}
+gt(profile_data(portfolios, "officer_portfolios.csv", "portfolio_id"))
+gt(profile_data(cultivation, "cultivation.csv"))
+gt(cultivation_links)
+gt(cultivation_funnel)
+```
 
+```{r}
 rm(portfolios, cultivation, cultivation_links, cultivation_funnel)
 gc()
 ```
@@ -340,34 +352,37 @@ gc()
 The checked-in Passport file may be a Git LFS pointer rather than data. This chunk reports that condition cleanly. After retrieving the LFS object, it will profile account reach, viewing time, completion, content, and device distribution.
 
 ```{r}
-# Verify that the file is data rather than a Git LFS pointer before importing it.
-passport_path <- file.path(data_dir, "passport_viewing.csv")
-first_line <- if (file.exists(passport_path)) read_lines(passport_path, n_max = 1) else ""
-passport_ready <- file.exists(passport_path) && first_line != "version https://git-lfs.github.com/spec/v1"
+# Import Passport viewing data
+passport <- read_project_csv("passport_viewing.txt")
 
-if (!passport_ready) {
-  cat("Passport viewing data is unavailable locally. Run git lfs pull, then render again.\n")
-} else {
-  passport <- read_project_csv("passport_viewing.csv")
-  passport_summary <- passport %>%
-    summarise(records = n(), accounts = n_distinct(UID),
-              linked_constituents = n_distinct(.data[["Constituent.ID"]], na.rm = TRUE),
-              watch_hours = sum(.data[["Time.Watched"]], na.rm = TRUE) / 3600,
-              median_completion_pct = 100 * median(.data[["Percent.Watched"]], na.rm = TRUE))
-  passport_content <- passport %>%
-    group_by(.data[["Content.Channel"]], Genre) %>%
-    summarise(accounts = n_distinct(UID), watch_hours = sum(.data[["Time.Watched"]], na.rm = TRUE) / 3600,
-              mean_completion_pct = 100 * mean(.data[["Percent.Watched"]], na.rm = TRUE), .groups = "drop") %>%
-    arrange(desc(accounts), desc(watch_hours))
-  passport_devices <- passport %>% count(Device, sort = TRUE) %>% mutate(record_pct = 100 * n / sum(n))
+passport_summary <- passport %>%
+  summarise(
+    records = n(),
+    linked_constituents = n_distinct(constituent_id, na.rm = TRUE),
+    total_titles_viewed = sum(titles_viewed, na.rm = TRUE),
+    median_completion_pct = median(mean_percent_watched, na.rm = TRUE)
+  )
 
-  show_table(profile_data(passport, "passport_viewing.csv", "UID"))
-  show_table(passport_summary)
-  show_table(head(passport_content, 20))
-  show_table(passport_devices)
-  rm(passport, passport_summary, passport_content, passport_devices)
-  gc()
-}
+passport_content <- passport %>%
+  group_by(fiscal_year, genre) %>%
+  summarise(
+    constituents = n_distinct(constituent_id, na.rm = TRUE),
+    titles_viewed = sum(titles_viewed, na.rm = TRUE),
+    mean_completion_pct = mean(mean_percent_watched, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(constituents), desc(titles_viewed))
+```
+
+```{r}
+gt(profile_data(passport, "passport_viewing.txt", "constituent_id"))
+gt(passport_summary)
+gt(head(passport_content, 20))
+```
+
+```{r}
+rm(passport, passport_summary, passport_content)
+gc()
 ```
 
 ## EDA conclusions and next steps
