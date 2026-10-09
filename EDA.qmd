@@ -12,16 +12,6 @@ execute:
   warning: false
 ---
 
-## Codex Session
-
-codex resume 01a10e2e-1a08-7650-949e-773c161f08e8
-
-## Purpose and approach
-
-This report provides reproducible exploratory data analysis for the synthetic PBS Utah donor release. It documents file grain, data quality, distributions, time coverage, and relationships before feature engineering or modeling. All findings describe synthetic data only.
-
-The source files are large. Each section loads one file, saves only small summaries, and removes the raw object before the next section. This makes rendering practical without keeping all nine files in memory.
-
 ## Setup
 
 ```{r}
@@ -123,14 +113,19 @@ segments <- constituents %>%
 ```
 
 ```{r}
-gt(constituent_profile)
+gt(constituent_profile) |>
+  tab_header(
+    title = "Constituent Data Profile"
+  )
+```
+
+196,167 rows; no duplicates; no missing key values
+
+```{r}
 gt(constituent_summary) |>
   tab_header(
-    title = ""
+    title = "Constituent Summary"
   )
-
-gt(head(constituent_missing, 12))
-gt(head(segments, 15))
 ```
 
 ```{r}
@@ -141,7 +136,32 @@ ggplot(filter(constituents, !is.na(Age)), aes(Age)) +
   theme_minimal()
 ```
 
-```{R}
+The median constituent age is 68 years old; 13.92% of constituents are PBS Utah sustainers (giving a monthly recurring gift).
+
+```{r}
+gt(head(constituent_missing, 12))
+```
+
+Variables with nearly 100% missing values:
+
+- UofU Degree Info
+- Latest UofU Degree Year
+- UofU Employment Status
+- Major Donor Class PBS Utah
+- Spouse Constituent ID
+- Marital Status
+
+```{r}
+gt(head(segments, 15))
+```
+
+```{r}
+#| echo: False
+cat("'Friends' Primary Constituent Type makes up", round(100 * (sum(segments$n[segments$`Primary Constituent Type` == "Friends"]) / sum(segments$n)), 2), "percent of the data.")
+```
+
+```{r}
+#| include: False
 # Release large raw data before analyzing transactions.
 rm(constituents, constituent_profile, constituent_missing, constituent_summary, segments)
 gc()
@@ -179,13 +199,24 @@ unite_mix <- unite %>%
 ```
 
 ```{r}
-gt(unite_profile)
+gt(unite_profile)|>
+  tab_header(
+    title = "Unite Data Profile"
+  )
+```
+
+1,722,698 rows; no duplicates; no missing key values
+
+```{r}
 gt(unite_quality) |>
   tab_header(
     title = "Unite Data Quality")
+```
 
+71,643 unique donors; 1,086 non-positive unite donations; no missing dates bewteen July 01, 2020 and June 30, 2026.
+
+```{r}
 gt(unite_by_year)
-gt(head(unite_mix, 15))
 ```
 
 ```{r}
@@ -195,7 +226,44 @@ ggplot(unite_by_year, aes(factor(fiscal_year), revenue)) +
   scale_y_continuous(labels = function(x) paste0("$", format(x, big.mark = ",", trim = TRUE))) +
   labs(title = "Unite payment revenue by fiscal year", x = "Fiscal year", y = "Revenue") +
   theme_minimal()
+```
 
+```{r}
+#| echo: False
+cat("$", format(sum(unite_by_year$revenue, na.rm = TRUE), big.mark = ",", scientific = FALSE), " of revenue generated since 2020.\n", sep = "")
+
+highest <- unite_by_year[which.max(unite_by_year$revenue), ]
+lowest <- unite_by_year[which.min(unite_by_year$revenue), ]
+
+cat("Highest revenue: $", format(highest$revenue, big.mark = ","),
+    " in fiscal year ", highest$fiscal_year, ".\n", sep = "")
+
+cat("Lowest revenue: $", format(lowest$revenue, big.mark = ","),
+    " in fiscal year ", lowest$fiscal_year, ".\n", sep = "")
+```
+
+```{r}
+gt(head(unite_mix, 10))
+```
+
+```{r}
+#| echo: False
+tender_summary <- unite_mix |>
+  group_by(tender_type) |>
+  summarise(revenue = sum(revenue, na.rm = TRUE))
+
+highest <- tender_summary |> slice_max(revenue, n = 1)
+lowest <- tender_summary |> slice_min(revenue, n = 1)
+
+cat("Highest revenue: $", format(highest$revenue, big.mark = ","),
+    " from tender type ", highest$tender_type, ".\n", sep = "")
+
+cat("Lowest revenue: $", format(lowest$revenue, big.mark = ","),
+    " from tender type ", lowest$tender_type, ".\n", sep = "")
+```
+
+```{r}
+#| include: False
 rm(unite, unite_profile, unite_quality, unite_by_year, unite_mix)
 gc()
 ```
@@ -228,17 +296,32 @@ legacy_channels <- legacy %>%
 
 ```{r}
 gt(profile_data(legacy, "team_approach_legacy_payments.csv", "ta_account_id"))
+```
+
+```{r}
+#| echo: False
+cat("Unique rows:", length(unique(legacy$ta_account_id)))
+```
+
+```{r}
 gt(legacy_quality)
+```
+
+```{r}
 gt(tail(legacy_year, 12))
+```
+
+```{r}
 gt(head(legacy_channels, 15))
 ```
 
 ```{r}
+#| include: False
 rm(legacy, legacy_quality, legacy_year, legacy_channels)
 gc()
 ```
 
-## Campaign codes and solicitation history
+## Campaign Codes and Solicitation History
 
 Campaign codes are reference data; campaign members are solicitation records. The anti-join checks whether every solicitation points to a known code. Response rates are descriptive, not causal measures of campaign effectiveness.
 
@@ -249,10 +332,6 @@ campaign_codes <- read_project_csv("campaign_codes.csv")
 campaign_members <- read_project_csv("campaign_members.csv") %>%
   mutate(campaign_start_date = as.Date(campaign_start_date),
          fiscal_year = fiscal_year(campaign_start_date))
-
-campaign_links <- campaign_members %>%
-  anti_join(select(campaign_codes, marketing_code = all_of("Marketing Code")), by = "marketing_code") %>%
-  summarise(unmatched_rows = n(), unmatched_codes = n_distinct(marketing_code))
 
 campaign_results <- campaign_members %>%
   group_by(fiscal_year) %>%
@@ -268,14 +347,37 @@ campaign_rank <- campaign_members %>%
 ```
 
 ```{r}
-gt(profile_data(campaign_codes, "campaign_codes.csv", "Marketing Code"))
-gt(profile_data(campaign_members, "campaign_members.csv"))
-gt(campaign_links)
+gt(profile_data(campaign_codes, "campaign_codes.csv", "Marketing Code"))|>
+  tab_header(
+    title = "Campaign Code Data Profile"
+  )
+```
+
+29,249 rows; 0 missing; 0 duplicates
+
+```{r}
 gt(campaign_results)
-gt(head(campaign_rank, 20))
 ```
 
 ```{r}
+#| echo: False
+cat("Average solicitation response rate:", round(mean(campaign_results$response_rate_pct), 2), "percent")
+```
+
+```{r}
+gt(head(campaign_rank, 5))
+```
+
+Most effective campaign: Synthetic Campaign 000456
+
+```{r}
+gt(tail(campaign_rank, 5))
+```
+
+Least effective campaign: Synthetic Campaign 028114
+
+```{r}
+#| include: False
 rm(campaign_codes, campaign_members, campaign_links, campaign_results, campaign_rank)
 gc()
 ```
@@ -302,11 +404,18 @@ soft_mix <- soft %>%
 
 ```{r}
 gt(profile_data(soft, "soft_credits.csv", "Credit ID"))
+```
+
+```{r}
 gt(soft_quality)
+```
+
+```{r}
 gt(soft_mix)
 ```
 
 ```{r}
+#| include: False
 rm(soft, soft_quality, soft_mix)
 gc()
 ```
@@ -337,9 +446,15 @@ cultivation_funnel <- cultivation %>%
 
 ```{r}
 gt(profile_data(portfolios, "officer_portfolios.csv", "portfolio_id"))
-gt(profile_data(cultivation, "cultivation.csv"))
-gt(cultivation_links)
-gt(cultivation_funnel)
+```
+
+```{r}
+cultivation_funnel |>
+  filter(fiscal_year == 2025) |>
+  gt() |>
+    tab_header(
+    title = "Latest Year Portfolios"
+  )
 ```
 
 ```{r}
@@ -375,18 +490,39 @@ passport_content <- passport %>%
 ```
 
 ```{r}
-gt(profile_data(passport, "passport_viewing.txt", "constituent_id"))
+gt(profile_data(passport, "passport_viewing.txt", "constituent_id")) |>
+    tab_header(
+    title = "Passport Data Profile"
+  )
+```
+
+```{r}
 gt(passport_summary)
+```
+
+```{r}
 gt(head(passport_content, 20))
 ```
 
 ```{r}
+#| echo: False
+genre_summary <- passport_content |>
+  group_by(genre) |>
+  summarise(titles_viewed = sum(titles_viewed, na.rm = TRUE))
+
+highest <- genre_summary |> slice_max(titles_viewed, n = 1)
+lowest <- genre_summary |> slice_min(titles_viewed, n = 1)
+
+cat("Most titles viewed: ", format(highest$titles_viewed, big.mark = ","),
+    " in genre ", highest$genre, ".\n", sep = "")
+
+cat("Fewest titles viewed: ", format(lowest$titles_viewed, big.mark = ","),
+    " in genre ", lowest$genre, ".\n", sep = "")
+```
+
+```{r}
+#| include: False
 rm(passport, passport_summary, passport_content)
 gc()
 ```
 
-## EDA conclusions and next steps
-
-Read the resulting tables before building features. Resolve unexpected duplicate keys, broken links, non-positive amounts, and missing dates. Define a single fiscal-year giving outcome using the documented direct-payment and soft-credit rules. Aggregate every source to an explicit analysis grain before joining it. Treat response rates and cultivation comparisons as descriptive until eligibility, selection, timing, and holdout design are confirmed. Passport nonappearance does not prove no viewing or account access.
-
-These checks are intended to become automated validation tests in the feature-engineering workflow.
