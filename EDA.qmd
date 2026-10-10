@@ -22,6 +22,11 @@ library(ggplot2)
 library(knitr)
 library(readr)
 library(tibble)
+library(sf)
+library(tigris)
+library(stringr)
+library(scales)
+library(tidyr)
 
 # Use one relative path so the report can run from the project root.
 data_dir <- "Data_Files"
@@ -62,7 +67,7 @@ show_table <- function(x) kable(x, format = "html", digits = 2,
                                 format.args = list(big.mark = ","))
 ```
 
-## Data inventory
+## Data Inventory
 
 The table grain is essential context for joins. A constituent, payment, legacy household gift, solicitation, soft credit, cultivation assignment, and viewing record are not interchangeable units.
 
@@ -90,7 +95,7 @@ gt(inventory) |>
     title = "Data File Library")
 ```
 
-## Constituents and memberships
+## Constituents and Memberships
 
 This entity table supplies donor attributes. First check the documented identifier, missingness, demographic distributions, and current membership attributes. Current snapshot variables must not be used as historical values.
 
@@ -139,6 +144,104 @@ ggplot(filter(constituents, !is.na(Age)), aes(Age)) +
 The median constituent age is 68 years old; 13.92% of constituents are PBS Utah sustainers (giving a monthly recurring gift).
 
 ```{r}
+#| include: False
+zip_summary <- constituents |>
+  mutate(
+    zip = str_sub(str_pad(as.character(`Address ZIP`), 5, pad = "0"), 1, 5)
+  ) |>
+  filter(str_detect(zip, "^[0-9]{5}$")) |>
+  count(zip, name = "constituents")
+
+# Download ZIP Code Tabulation Areas
+us_zips <- zctas(
+  year = 2020,
+  cb = TRUE,
+  class = "sf"
+)
+
+# Download Utah state boundary
+utah <- states(
+  cb = TRUE,
+  class = "sf"
+) |>
+  filter(STUSPS == "UT") |>
+  st_transform(5070)
+```
+
+```{r}
+# Keep ZCTAs intersecting Utah
+utah_zips <- us_zips |>
+  st_transform(5070) |>
+  st_filter(utah) |>
+  mutate(zip = ZCTA5CE20)
+
+utah_map <- utah_zips |>
+  left_join(zip_summary, by = "zip") |>
+  mutate(
+    constituents = replace_na(constituents, 0)
+  )
+
+utah_zip_map <- ggplot() +
+  geom_sf(
+    data = utah_map,
+    aes(fill = constituents),
+    color = "white",
+    linewidth = 0.1
+  ) +
+  geom_sf(
+    data = utah,
+    fill = NA,
+    color = "#333333",
+    linewidth = 0.6
+  ) +
+  scale_fill_gradient(
+    low = "#dff2fe",
+    high = "#0377af",
+    labels = comma,
+    name = "Constituents"
+  ) +
+  coord_sf(expand = FALSE) +
+  labs(
+    title = "PBS Utah Constituents by ZIP Code",
+    subtitle = "Geographic distribution of constituents across Utah"
+  ) +
+  theme_void(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 11),
+    legend.position = "right",
+    plot.margin = margin(15, 15, 15, 15)
+  )
+
+utah_zip_map
+```
+
+```{r}
+zip_summary |>
+  arrange(desc(constituents)) |>
+  head() |>
+  gt() |>
+  tab_header(title = "Constituents by ZIP Code") |>
+  cols_label(
+    zip = "ZIP Code",
+    constituents = "Constituents"
+  ) |>
+  fmt_number(columns = constituents, decimals = 0)
+```
+
+```{r}
+#| echo: False
+utah_zip_summary <- zip_summary |>
+  semi_join(st_drop_geometry(utah_zips), by = "zip")
+
+cat("Placeholder '84000' ZIP code used for",
+    round(100 * sum(zip_summary$constituents[zip_summary$zip == "84000"]) /
+            sum(utah_zip_summary$constituents), 2),
+    "percent of Utah constituents.")
+``` 
+
+
+```{r}
 gt(head(constituent_missing, 12))
 ```
 
@@ -163,7 +266,7 @@ cat("'Friends' Primary Constituent Type makes up", round(100 * (sum(segments$n[s
 ```{r}
 #| include: False
 # Release large raw data before analyzing transactions.
-rm(constituents, constituent_profile, constituent_missing, constituent_summary, segments)
+rm(constituents, constituent_profile, constituent_missing, constituent_summary, segments, us_zips, utah, utah_map, zip_summary)
 gc()
 ```
 
@@ -526,3 +629,12 @@ rm(passport, passport_summary, passport_content)
 gc()
 ```
 
+## Key Findings
+
+The exploratory data analysis provides an overview of PBS Utah's constituent demographics, donation history, campaign responses, cultivation activities, and Passport viewing engagement. The constituent data includes 196,167 records, with a median age of 68 and approximately 13.92% identified as sustaining members. Unite payment records contain over 1.7 million transactions from fiscal years 2021 through 2026, providing a substantial history of giving behavior. Campaign and Passport data offer additional information about constituent engagement beyond financial contributions.
+
+The analysis also identified important considerations for future modeling, including missing demographic information, differences in how datasets are structured, and the need to distinguish direct donations from soft credits. Overall, these datasets provide a foundation for identifying patterns in constituent giving and engagement that may help PBS Utah prioritize potential major donors. Further analysis will be needed to determine which characteristics are most useful for identifying constituents with the potential to increase their annual giving.
+
+## AI Disclosure
+
+I used OpenAI Codex to create the initial EDA file template, including section headers and code to load and clear datasets to reduce memory usage. After running and reviewing the code chunks, I added cat() statements and additional analyses to summarize key findings and connect the results throughout the report.
