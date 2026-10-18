@@ -1,0 +1,77 @@
+# Professor's Notes: Data Quality and Cleaning
+
+## 1. Data Dictionary Update
+
+The professor identified an omission in the latest version of the data dictionary's **Known Issues** section.
+
+Some ID fields contain synthetic labels, including:
+
+- `SYN-DEF-`
+- `SYN-UNMATCHED`
+- `SYN-ORPHAN`
+
+These labels identify artificially introduced data problems and will not be available in PBS Utah's real data.
+
+**Important:** Do not use these labels as shortcuts for data cleaning or as predictors in modeling.
+
+## 2. Known Data Issues: Copy Rows
+
+Some records are copies of existing rows within the same file. These copies have either a missing link or an amount set to zero.
+
+None of these copied records represents actual constituent giving.
+
+### A. `unite_payments.csv`
+
+- The donor or marketing code may be `SYN-ORPHAN`.
+- The payment amount may be zero.
+- A copied row shares the `opportunity_id` of the original payment.
+- Synthetic copy IDs begin with `SYN-DEF-`.
+
+### B. `soft_credits.csv`
+
+- The recipient may be `SYN-ORPHAN`.
+- The amount may be zero.
+- Synthetic copy IDs begin with `SYN-DEF-`.
+
+### C. `team_approach_legacy_payments.csv`
+
+- Constituent IDs may be blank.
+- A copied row shares the `source_code` of the original record.
+- Synthetic copy IDs begin with `SYN-UNMATCHED`.
+
+## 3. Data Cleaning Requirements
+
+Develop reusable data quality checks that identify problems using:
+
+1. **Links:** Validate relationships between records and their associated constituents, payments, or marketing codes.
+2. **Amounts:** Examine zero amounts and other potentially invalid payment values.
+3. **Dates:** Check for missing, inconsistent, or invalid dates.
+4. **Duplicates:** Identify copied or duplicated records using relevant fields and relationships.
+
+Do not rely on synthetic labels to identify problematic records.
+
+## 4. ID Handling Requirements
+
+- Retain IDs for joining datasets and tracking records.
+- Do not use IDs or synthetic labels as model predictors.
+- Do not remove records solely because their IDs contain `SYN`.
+- Evaluate records using data quality checks rather than ID prefixes.
+
+## 5. Documentation Requirements
+
+Document all data cleaning decisions, including:
+
+- The data quality issue identified.
+- The checks used to identify the issue.
+- The decision to retain, correct, exclude, or flag affected records.
+- Whether the decision depends on characteristics specific to the synthetic dataset.
+
+**Important distinction:** In real PBS Utah data, a missing marketing-code match does not necessarily indicate that a payment is invalid.
+
+## 6. Key Takeaways
+
+- Identify data quality problems through reusable validation checks.
+- Do not rely on synthetic identifiers or labels.
+- Preserve IDs for joins and record tracking, but exclude them from modeling predictors.
+- Distinguish between genuinely invalid records and records with missing relationships.
+- Document all cleaning decisions and their applicability to real-world data.
