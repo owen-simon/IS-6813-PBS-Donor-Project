@@ -1,0 +1,402 @@
+---
+title: "PBS Utah Prospect Prioritization Modeling"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Table of Contents"
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| include: false
+RANDOM_SEED <- 42
+set.seed(RANDOM_SEED)
+
+library(caret)
+library(pROC)
+library(randomForest)
+library(gbm)
+library(glmnet)
+library(doParallel)
+library(foreach)
+library(tidyverse)
+library(DT)
+```
+
+## Modeling objective
+
+PBS Utah needs a short, reviewable list of lower-level donors for Major Gifts
+staff to contact. This document compares models by their ability to rank
+eligible constituents, rather than by classification accuracy alone.
+
+The target is whether an eligible constituent will give **$2,000 to $15,000 in
+the following fiscal year**. Eligibility at the decision date is annual giving
+greater than $0 and less than $2,000. This keeps the modeling population aligned
+with the stated lower-level-donor prospecting use case.
+
+The training period is FY2021--FY2024. FY2025 is held out as a chronological
+test: all FY2025 predictors were known at the decision date and its outcome is
+FY2026 giving. The final scorecard emphasizes precision and lift in the first
+100 and 250 constituents, which are more meaningful to a finite outreach team
+than overall accuracy.
+
+```{r read-data}
+analytic <- read.csv(
+  "Data_Files/constituent_fiscal_year_analytic.csv"
+)
+
+quality_report <- read.csv(
+  "Data_Files/feature_engineering_quality_report.csv"
+)
+
+datatable(quality_report, caption = "Feature-engineering quality checks")
+```
+
+## Data review and feature exclusions
+
+The engineering report documents that duplicate/copy artifacts were removed
+through link, amount, date, and duplicate checks—not by using synthetic ID
+labels. The report should be retained with the analysis for auditability.
+
+The following columns are deliberately excluded from modeling:
+
+- `constituent_id`: join and review key, never a predictor.
+- `next_fy_*`: future outcomes; using them would leak the answer.
+- `*_snapshot`: end-of-data constituent snapshots. They are useful dashboard
+  context but are not known historically for every fiscal-year scoring record.
+- `cultivation_*`: selection/contact/holdout are program-assignment fields,
+  not pre-contact donor characteristics. They belong in a separate cultivation
+  effect analysis, not in a prospect score.
+- `fiscal_year`: used to create the chronological split, not a donor feature.
+
+```{r build-model-frame}
+TARGET_MIN <- 2000
+TARGET_MAX <- 15000
+TRAIN_YEARS <- 2021:2024
+TEST_YEAR <- 2025
+CONTACT_LIST_SIZES <- c(100, 250)
+
+model_frame <- analytic %>%
+  filter(
+    fiscal_year %in% c(TRAIN_YEARS, TEST_YEAR),
+    annual_giving > 0,
+    annual_giving < TARGET_MIN,
+    !is.na(next_fy_giving)
+  ) %>%
+  mutate(
+    target_range_next_fy = factor(
+      if_else(next_fy_giving >= TARGET_MIN & next_fy_giving <= TARGET_MAX,
+              "yes", "no"),
+      levels = c("yes", "no")
+    )
+  )
+
+outcome_columns <- c(
+  "next_fy_giving", "next_fy_reached_2000", "next_fy_giving_growth",
+  "target_range_next_fy"
+)
+
+excluded_columns <- names(model_frame)[
+  names(model_frame) == "constituent_id" |
+    names(model_frame) == "fiscal_year" |
+    names(model_frame) %in% outcome_columns |
+    str_detect(names(model_frame), "_snapshot$") |
+    str_detect(names(model_frame), "^cultivation_")
+]
+
+# All remaining engineered predictors are numeric. Keeping the type restriction
+# prevents accidental use of an unreviewed text or identifier field.
+predictor_columns <- model_frame %>%
+  select(-all_of(excluded_columns)) %>%
+  select(where(is.numeric)) %>%
+  names()
+
+feature_audit <- model_frame %>%
+  summarise(across(
+    all_of(predictor_columns),
+    list(
+      missing_rate = ~ mean(is.na(.x)),
+      distinct_values = ~ n_distinct(.x, na.rm = TRUE),
+      zero_rate = ~ mean(.x == 0, na.rm = TRUE)
+    )
+  )) %>%
+  pivot_longer(everything(), names_to = c("feature", ".value"),
+               names_pattern = "(.*)_(missing_rate|distinct_values|zero_rate)$") %>%
+  arrange(desc(missing_rate), distinct_values)
+
+datatable(feature_audit, caption = "Candidate-predictor audit")
+
+zero_variance_features <- names(nearZeroVar(model_frame[predictor_columns], saveMetrics = TRUE) %>%
+  rownames_to_column("feature") %>%
+  filter(nzv) %>%
+  pull(feature))
+
+if (length(zero_variance_features) > 0) {
+  cat("Near-zero-variance features removed before modeling:\n")
+  print(zero_variance_features)
+  predictor_columns <- setdiff(predictor_columns, zero_variance_features)
+} else {
+  cat("No near-zero-variance features were found.\n")
+}
+
+model_data <- model_frame %>%
+  select(constituent_id, fiscal_year, target_range_next_fy, all_of(predictor_columns))
+
+train_data <- model_data %>% filter(fiscal_year %in% TRAIN_YEARS)
+test_data <- model_data %>% filter(fiscal_year == TEST_YEAR)
+
+stopifnot(nrow(train_data) > 0, nrow(test_data) > 0)
+stopifnot(n_distinct(train_data$target_range_next_fy) == 2)
+stopifnot(n_distinct(test_data$target_range_next_fy) == 2)
+
+# caret's formula interface calls `na.fail()` before its `preProcess` argument
+# can impute values. Create missingness indicators, then impute predictors with
+# training-period medians only. This avoids both model errors and test-set
+# leakage. A zero fallback is used only when a training feature is entirely NA.
+missing_predictors <- predictor_columns[
+  vapply(train_data[predictor_columns], function(x) any(is.na(x)), logical(1))
+]
+
+for (column in missing_predictors) {
+  indicator <- paste0(column, "_missing")
+  train_data[[indicator]] <- as.integer(is.na(train_data[[column]]))
+  test_data[[indicator]] <- as.integer(is.na(test_data[[column]]))
+
+  training_median <- median(train_data[[column]], na.rm = TRUE)
+  if (is.na(training_median)) training_median <- 0
+
+  train_data[[column]][is.na(train_data[[column]])] <- training_median
+  test_data[[column]][is.na(test_data[[column]])] <- training_median
+}
+
+predictor_columns <- c(predictor_columns, paste0(missing_predictors, "_missing"))
+
+stopifnot(!anyNA(train_data[predictor_columns]))
+stopifnot(!anyNA(test_data[predictor_columns]))
+
+bind_rows(
+  train_data %>% summarise(split = "Training FY2021--FY2024", records = n(), positive_rate = mean(target_range_next_fy == "yes")),
+  test_data %>% summarise(split = "Chronological test FY2025", records = n(), positive_rate = mean(target_range_next_fy == "yes"))
+) %>% datatable(caption = "Eligible prospect population")
+```
+
+## Base model training
+
+### Parallel processing setup
+
+```{r parallel-setup}
+n_cores <- max(1, parallel::detectCores() - 1)
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+cat("Using", foreach::getDoParWorkers(), "cores\n")
+```
+
+### Cross-validation setup
+
+The held-out fiscal year is never used to choose a model. Repeated
+cross-validation within the training years tunes models using ROC AUC; the
+separate chronological test determines which model creates the strongest
+contact list.
+
+```{r cv-setup}
+cv_control <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 2,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  allowParallel = TRUE
+)
+
+model_formula <- as.formula("target_range_next_fy ~ .")
+train_model_data <- train_data %>% select(-constituent_id, -fiscal_year)
+test_model_data <- test_data %>% select(-constituent_id, -fiscal_year)
+```
+
+### Logistic regression
+
+```{r logistic}
+set.seed(RANDOM_SEED)
+log_model <- train(
+  model_formula, data = train_model_data, method = "glm", family = "binomial",
+  metric = "ROC", preProcess = c("medianImpute", "nzv"), trControl = cv_control
+)
+```
+
+### Decision tree
+
+```{r decision-tree}
+set.seed(RANDOM_SEED)
+tree_model <- train(
+  model_formula, data = train_model_data, method = "rpart", metric = "ROC",
+  preProcess = c("medianImpute", "nzv"), trControl = cv_control, tuneLength = 8
+)
+```
+
+### Random forest
+
+```{r random-forest}
+set.seed(RANDOM_SEED)
+rf_model <- train(
+  model_formula, data = train_model_data, method = "rf", metric = "ROC",
+  ntree = 500, importance = TRUE, preProcess = c("medianImpute", "nzv"),
+  trControl = cv_control, tuneLength = 4
+)
+```
+
+### Gradient boosting
+
+```{r gradient-boosting}
+set.seed(RANDOM_SEED)
+gbm_model <- train(
+  model_formula, data = train_model_data, method = "gbm", metric = "ROC",
+  verbose = FALSE, preProcess = c("medianImpute", "nzv"),
+  trControl = cv_control, tuneLength = 5
+)
+```
+
+### Regularized logistic regression
+
+```{r regularized-logistic}
+set.seed(RANDOM_SEED)
+enet_model <- train(
+  model_formula, data = train_model_data, method = "glmnet", family = "binomial",
+  metric = "ROC", preProcess = c("medianImpute", "nzv", "center", "scale"),
+  trControl = cv_control,
+  tuneGrid = expand.grid(
+    alpha = c(0, 0.25, 0.5, 0.75, 1),
+    lambda = 10^seq(-4, 0, length.out = 8)
+  )
+)
+```
+
+### Bagged decision trees
+
+```{r bagging}
+set.seed(RANDOM_SEED)
+bag_model <- train(
+  model_formula, data = train_model_data, method = "treebag", metric = "ROC",
+  preProcess = c("medianImpute", "nzv"), trControl = cv_control
+)
+```
+
+## Model comparison: ranked contact lists
+
+### Cross-validation results
+
+```{r cv-results}
+get_cv_metrics <- function(model, model_name) {
+  best <- model$bestTune
+  results <- model$results
+  for (parameter in names(best)) {
+    results <- results[results[[parameter]] == best[[parameter]], , drop = FALSE]
+  }
+  tibble(
+    model = model_name,
+    cv_auc = round(results$ROC[1], 4),
+    cv_sensitivity = round(results$Sens[1], 4),
+    cv_specificity = round(results$Spec[1], 4)
+  )
+}
+
+models <- list(
+  "Logistic regression" = log_model,
+  "Decision tree" = tree_model,
+  "Random forest" = rf_model,
+  "Gradient boosting" = gbm_model,
+  "Elastic net" = enet_model,
+  "Bagged trees" = bag_model
+)
+
+cv_comparison <- imap_dfr(models, get_cv_metrics) %>% arrange(desc(cv_auc))
+datatable(cv_comparison, caption = "Cross-validation comparison")
+```
+
+### Chronological test-list metrics
+
+The primary evaluation is the quality of the ranked outreach list. Precision at
+K answers: “Of the first K constituents staff review, what share actually
+reached the target range next year?” Lift compares that result with contacting
+K eligible constituents at random.
+
+```{r contact-list-functions}
+contact_list_metrics <- function(model, model_name, test_frame, list_sizes) {
+  scored <- test_frame %>%
+    mutate(probability = predict(model, newdata = test_model_data, type = "prob")$yes) %>%
+    arrange(desc(probability))
+
+  baseline_rate <- mean(scored$target_range_next_fy == "yes")
+
+  map_dfr(list_sizes, function(k) {
+    reviewed <- slice_head(scored, n = min(k, nrow(scored)))
+    precision <- mean(reviewed$target_range_next_fy == "yes")
+    tibble(
+      model = model_name,
+      contact_list_size = nrow(reviewed),
+      precision_at_k = precision,
+      lift_at_k = precision / baseline_rate,
+      prospects_reaching_target = sum(reviewed$target_range_next_fy == "yes"),
+      captured_share_of_all_targets = sum(reviewed$target_range_next_fy == "yes") /
+        sum(scored$target_range_next_fy == "yes")
+    )
+  })
+}
+
+contact_list_results <- imap_dfr(
+  models,
+  ~ contact_list_metrics(.x, .y, test_data, CONTACT_LIST_SIZES)
+) %>%
+  arrange(contact_list_size, desc(precision_at_k), desc(lift_at_k))
+
+datatable(contact_list_results, caption = "Chronological test: ranked contact-list performance")
+```
+
+### Test-set diagnostic metrics
+
+These secondary diagnostics help identify models with strong ranking but poor
+probability behavior. They should not outweigh the contact-list metrics in the
+selection decision.
+
+```{r test-diagnostics}
+test_diagnostics <- imap_dfr(models, function(model, model_name) {
+  probabilities <- predict(model, newdata = test_model_data, type = "prob")$yes
+  roc_object <- roc(test_data$target_range_next_fy, probabilities, levels = c("no", "yes"), quiet = TRUE)
+  tibble(
+    model = model_name,
+    test_auc = as.numeric(auc(roc_object)),
+    test_pr_auc = prSummary(
+      data.frame(obs = test_data$target_range_next_fy, yes = probabilities, no = 1 - probabilities),
+      lev = c("yes", "no")
+    )["AUC"]
+  )
+}) %>% arrange(desc(test_auc))
+
+datatable(test_diagnostics, caption = "Chronological-test diagnostic metrics")
+```
+
+### Review checklist before selecting a final model
+
+- Prefer the model with the strongest, stable precision/lift at the actual
+  contact-list size PBS Utah can staff.
+- Compare its results at both 100 and 250 names; avoid selecting a model on a
+  trivial improvement at only one cutoff.
+- Review the highest-ranked constituents with fundraising staff for face
+  validity and inappropriate records.
+- Check whether the list is dominated by current sustainers or another segment
+  that would not represent a useful Major Gifts pipeline.
+- Consider interpretability, maintainability, and score stability alongside the
+  test metrics.
+
+### End processing setup
+
+```{r stop-parallel}
+stopCluster(cl)
+registerDoSEQ()
+cat("Parallel processing stopped\n")
+```
