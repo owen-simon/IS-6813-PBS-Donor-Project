@@ -7,9 +7,15 @@ Inputs are never modified. The script writes:
   * Data_Files/constituent_fiscal_year_analytic.csv
   * Data_Files/feature_engineering_quality_report.csv
 
-Each output row is one constituent in one fiscal year. Feature columns use
-information available in that year or before. `next_fy_*` columns are future
-outcomes for model training/evaluation and must not be model inputs.
+Each output row is one constituent in one fiscal year. Exclude `next_fy_*`,
+`major_donor_next_fy`, `*_snapshot`, cultivation fields, IDs and `data_split`
+from predictors. FY2026 outcomes are unknown until FY2027 data are available.
+
+Campaign responses are a proxy: the release defines `responded` as a payment
+with the same constituent, marketing code and fiscal year, not verified causal
+attribution to a solicitation. Repeated nonresponse rows are distinct exposures;
+one response may represent multiple payments. The campaign start date is a
+fiscal-year marker, not the actual contact date.
 """
 
 from __future__ import annotations
@@ -62,9 +68,9 @@ def read_csv(name: str, **kwargs) -> pd.DataFrame:
 def aggregate_campaign_members(valid_ids: set[str], campaign_codes: pd.DataFrame, quality: list[dict]) -> pd.DataFrame:
     """Aggregate solicitation exposure/responses in chunks to keep memory bounded."""
     path = DATA / "campaign_members.csv"
-    required = {"constituent_id", "marketing_code", "responded", "campaign_start_date"}
+    required = {"constituent_id", "marketing_code", "responded", "campaign_start_date", "responded_date"}
     pieces = []
-    for chunk in pd.read_csv(path, chunksize=CHUNK_SIZE, dtype="string", low_memory=False):
+    for chunk in pd.read_csv(path, chunksize=CHUNK_SIZE, dtype="string", low_memory=False, usecols=list(required)):
         require_columns(chunk, required, path.name)
         chunk["campaign_start_date"] = pd.to_datetime(chunk["campaign_start_date"], errors="coerce")
         chunk["fiscal_year"] = fiscal_year(chunk["campaign_start_date"])
@@ -72,18 +78,29 @@ def aggregate_campaign_members(valid_ids: set[str], campaign_codes: pd.DataFrame
         usable = linked & chunk["fiscal_year"].notna()
         report(quality, "campaign_members", "unlinked constituent IDs", (~linked).sum(), "Excluded from constituent features")
         report(quality, "campaign_members", "invalid/missing fiscal-year marker", (linked & chunk["fiscal_year"].isna()).sum(), "Excluded from annual features")
-        part = chunk.loc[usable, ["constituent_id", "marketing_code", "responded", "fiscal_year"]].copy()
-        part["responded"] = as_bool(part["responded"])
-        part = part.merge(campaign_codes, on="marketing_code", how="left")
-        part["campaign_code_linked"] = part["communication_method"].notna()
-        pieces.append(part.groupby(["constituent_id", "fiscal_year"], as_index=False).agg(
+        part = chunk.loc[usable, ["constituent_id", "marketing_code", "responded", "responded_date", "fiscal_year"]].copy()
+        response_date = pd.to_datetime(part["responded_date"], errors="coerce")
+        response = as_bool(part["responded"])
+        valid_response = response & response_date.notna() & fiscal_year(response_date).eq(part["fiscal_year"]).fillna(False)
+        report(quality, "campaign_members", "response date missing or outside marker fiscal year", (response & ~valid_response).sum(), "Response excluded from annual response features")
+        part["responded"] = valid_response.astype(int)
+        part = part.merge(campaign_codes, on="marketing_code", how="left", validate="many_to_one", indicator=True)
+        part["campaign_code_linked"] = part["_merge"].eq("both").astype(int)
+        for method in ["mail", "phone", "email", "digital", "in-person", "miscellaneous"]:
+            mask = part["communication_method"].str.lower().eq(method).fillna(False)
+            name = clean_name(method)
+            part[f"solicitations_{name}"] = mask.astype(int)
+            part[f"responses_{name}"] = (mask & valid_response.to_numpy()).astype(int)
+        sums = {c: (c, "sum") for c in part.columns if c.startswith(("solicitations_", "responses_"))}
+        pieces.append(part.groupby(["constituent_id", "fiscal_year", "marketing_code"], as_index=False, dropna=False).agg(
             solicitations=("marketing_code", "size"),
-            unique_campaigns_solicited=("marketing_code", "nunique"),
             campaign_responses=("responded", "sum"),
-            campaign_code_link_rate=("campaign_code_linked", "mean"),
+            campaign_codes_linked=("campaign_code_linked", "sum"), **sums,
         ))
     combined = pd.concat(pieces, ignore_index=True)
-    return combined.groupby(["constituent_id", "fiscal_year"], as_index=False).sum()
+    combined = combined.groupby(["constituent_id", "fiscal_year", "marketing_code"], as_index=False, dropna=False).sum()
+    combined["unique_campaigns_solicited"] = combined["marketing_code"].notna().astype(int)
+    return combined.drop(columns="marketing_code").groupby(["constituent_id", "fiscal_year"], as_index=False).sum()
 
 
 def main() -> None:
@@ -230,33 +247,52 @@ def main() -> None:
     # Unite/campaign data begin in FY2021.  Retain two earlier years only to
     # calculate time-safe trailing features, then remove them from the output.
     earliest_panel_fy = ANALYTIC_START_FY - HISTORY_YEARS_NEEDED
-    years = [year for year in sorted(set(giving["fiscal_year"].dropna()) | set(campaign["fiscal_year"].dropna()) | set(viewing["fiscal_year"].dropna())) if year >= earliest_panel_fy]
+    years = list(range(earliest_panel_fy, 2027))
     panel = pd.MultiIndex.from_product([sorted(valid_ids), years], names=["constituent_id", "fiscal_year"]).to_frame(index=False)
     for frame in [giving, campaign, viewing, cultivation]:
         panel = panel.merge(frame, on=["constituent_id", "fiscal_year"], how="left", validate="one_to_one")
     panel = panel.merge(snapshot, on="constituent_id", how="left", validate="many_to_one")
 
-    for column in ["direct_payment_amount", "direct_payment_count", "soft_credit_amount", "soft_credit_count", "recurring_payment_count", "solicitations", "unique_campaigns_solicited", "campaign_responses", "passport_titles_viewed", "passport_genres_viewed"]:
+    for column in ["direct_payment_amount", "direct_payment_count", "soft_credit_amount", "soft_credit_count", "recurring_payment_count", "solicitations", "unique_campaigns_solicited", "campaign_responses", "campaign_codes_linked", "passport_titles_viewed", "passport_genres_viewed"] + [c for c in panel if c.startswith(("solicitations_", "responses_"))]:
         if column in panel:
             panel[column] = panel[column].fillna(0)
     panel["annual_giving"] = panel["direct_payment_amount"] + panel["soft_credit_amount"]
     panel["gave_this_fy"] = (panel["annual_giving"] > 0).astype("int8")
     panel["campaign_response_rate"] = panel["campaign_responses"].div(panel["solicitations"].where(panel["solicitations"] > 0))
+    panel["campaign_code_link_rate"] = panel["campaign_codes_linked"].div(panel["solicitations"].where(panel["solicitations"] > 0))
     panel["passport_data_present"] = panel["passport_mean_percent_watched"].notna().astype("int8")
 
     panel = panel.sort_values(["constituent_id", "fiscal_year"])
     grouped = panel.groupby("constituent_id", sort=False)
+    for column in ["solicitations", "campaign_responses"]:
+        panel[f"prior_fy_{column}"] = grouped[column].shift(1).fillna(0)
+        panel[f"trailing_3_fy_{column}"] = panel[column] + grouped[column].shift(1).fillna(0) + grouped[column].shift(2).fillna(0)
+    panel["trailing_3_fy_response_rate"] = panel["trailing_3_fy_campaign_responses"].div(panel["trailing_3_fy_solicitations"].where(panel["trailing_3_fy_solicitations"] > 0))
     panel["prior_fy_giving"] = grouped["annual_giving"].shift(1).fillna(0)
     panel["two_fy_prior_giving"] = grouped["annual_giving"].shift(2).fillna(0)
     panel["giving_trend_vs_prior_fy"] = panel["annual_giving"] - panel["prior_fy_giving"]
-    panel["trailing_3_fy_giving"] = grouped["annual_giving"].transform(lambda s: s.rolling(3, min_periods=1).sum())
-    panel["trailing_3_fy_gift_count"] = grouped["direct_payment_count"].transform(lambda s: s.rolling(3, min_periods=1).sum())
+    panel["trailing_3_fy_giving"] = panel["annual_giving"] + panel["prior_fy_giving"] + panel["two_fy_prior_giving"]
+    panel["trailing_3_fy_gift_count"] = panel["direct_payment_count"] + grouped["direct_payment_count"].shift(1).fillna(0) + grouped["direct_payment_count"].shift(2).fillna(0)
     panel["next_fy_giving"] = grouped["annual_giving"].shift(-1)
     panel["next_fy_reached_2000"] = (panel["next_fy_giving"] >= 2000).astype("Int64")
     panel.loc[panel["next_fy_giving"].isna(), "next_fy_reached_2000"] = pd.NA
     panel["next_fy_giving_growth"] = panel["next_fy_giving"] - panel["annual_giving"]
+    panel["major_donor_next_fy"] = ((panel["annual_giving"] < 2000) & panel["next_fy_giving"].between(2000, 15000)).astype("Int64")
+    panel.loc[panel["next_fy_giving"].isna(), "major_donor_next_fy"] = pd.NA
+    panel["data_split"] = panel["fiscal_year"].map(lambda y: "development" if y <= 2024 else ("final_test" if y == 2025 else "prediction"))
 
     panel = panel.loc[panel["fiscal_year"] >= ANALYTIC_START_FY].copy()
+
+    assert not panel.duplicated(["constituent_id", "fiscal_year"]).any()
+    assert len(panel) == len(valid_ids) * 6
+    assert (panel["campaign_responses"] <= panel["solicitations"]).all()
+    assert panel.loc[panel["fiscal_year"] == 2026, "next_fy_giving"].isna().all()
+    assert panel.loc[panel["fiscal_year"] == 2026, "major_donor_next_fy"].isna().all()
+    assert panel.loc[panel["fiscal_year"] < 2026, "major_donor_next_fy"].notna().all()
+    assert panel.groupby("fiscal_year")["data_split"].first().to_dict() == {2021: "development", 2022: "development", 2023: "development", 2024: "development", 2025: "final_test", 2026: "prediction"}
+    expected = (panel["annual_giving"] < 2000) & panel["next_fy_giving"].between(2000, 15000)
+    observed = panel["major_donor_next_fy"].notna()
+    assert panel.loc[observed, "major_donor_next_fy"].astype(bool).eq(expected[observed]).all()
 
     panel.to_csv(OUTPUT, index=False)
     pd.DataFrame(quality).groupby(["table", "check", "decision"], as_index=False)["affected_rows"].sum().to_csv(QUALITY_REPORT, index=False)
