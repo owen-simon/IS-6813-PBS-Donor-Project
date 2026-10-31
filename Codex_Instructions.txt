@@ -1,0 +1,87 @@
+Review and revise my existing `Feature_Engineering.py` and `Modeling.qmd` documents for the PBS Utah donor analytics project. I want to improve the modeling workflow using expanding-window temporal validation while keeping the code readable, understandable, and appropriate for a graduate business analytics project. Do not rewrite either document from scratch or unnecessarily change working code.
+
+**Project objective and target definition**
+
+The goal is to identify constituents who are not currently major donors but have the potential to become major donors through future fundraising outreach. A major donor is defined as someone giving $1,200 or more annually. Therefore, the eligible population consists of constituents giving less than $1,200 in the current fiscal year, and the target is whether they give $1,200 or more in the following fiscal year. This is a predictive modeling exercise, not a causal analysis of solicitation effectiveness. Historical solicitation-response features may help identify promising prospects, but they do not establish that solicitation causes a constituent to become a major donor.
+
+**Feature engineering**
+
+Review `Feature_Engineering.py` to verify that the constituent-by-fiscal-year panel correctly aligns predictors from fiscal year t with major-donor conversion in fiscal year t+1. The script already creates a panel with historical giving, solicitation-response, and other features. Preserve its existing structure and data processing unless changes are necessary.
+
+Pay particular attention to the major-donor threshold. The intended definition is current annual giving less than $1,200 and following-year annual giving greater than or equal to $1,200. Update the existing target definition and any related eligibility filters or documentation if they still use the previous threshold of current giving less than or equal to $1,200 and following-year giving greater than $1,200. Ensure that the definition is consistent throughout the project.
+
+Verify that solicitation-response features use only information available during or before the feature fiscal year. Prior-year and trailing features must not include future information. Continue excluding future-looking outcomes, snapshot variables, cultivation variables, identifiers, and other inappropriate fields from modeling predictors. Preserve FY2026 as an unlabeled feature year because FY2027 outcomes are unavailable.
+
+Only regenerate the analytic CSV if the feature engineering script changes. Preserve the existing file paths and quality-report functionality.
+
+**Temporal modeling strategy**
+
+Revise `Modeling.qmd` to use expanding-window temporal validation. Each constituent-year observation contains predictors from one fiscal year and an outcome indicating whether the constituent became a major donor in the following fiscal year.
+
+Use these chronological validation folds:
+
+- Fold 1: Train on FY2021 feature rows, predict using FY2022 feature rows, and evaluate against FY2023 outcomes.
+- Fold 2: Train on FY2021–FY2022 feature rows, predict using FY2023 feature rows, and evaluate against FY2024 outcomes.
+- Fold 3: Train on FY2021–FY2023 feature rows, predict using FY2024 feature rows, and evaluate against FY2025 outcomes.
+
+The third fold is particularly important because it represents my final individual evaluation. I want to determine how well models trained on historical data identify constituents who actually became new major donors in FY2025.
+
+For each fold, make it clear which years are used for model training, which year's features are used for prediction, and which year's giving outcomes are used for evaluation. Do not accidentally shift the target a second time, since the feature engineering script already aligns following-year outcomes with each feature-year row.
+
+**Preserve the group's final test**
+
+My individual work is one component of a larger group project. The group will eventually combine features from multiple team members to build a comprehensive major-donor prediction model.
+
+Reserve FY2025 feature rows and their FY2026 outcomes entirely for the group's final combined-model evaluation. Do not use these rows or outcomes for individual model training, validation, feature selection, hyperparameter tuning, threshold selection, or performance reporting.
+
+The group should eventually be able to train its combined model using FY2021–FY2024 feature rows and evaluate it on FY2025 feature rows, which predict FY2026 major-donor conversion. FY2026 feature rows would instead be used to predict FY2027 outcomes, which are not yet observed.
+
+**Models and feature comparisons**
+
+My individual responsibility is to evaluate the predictive value of solicitation-response features. Compare four algorithms: logistic regression, elastic net logistic regression, random forest, and XGBoost.
+
+For each algorithm, evaluate two feature configurations: a baseline excluding solicitation-response features and a model including those features. The purpose is to determine whether historical solicitation-response behavior provides incremental predictive value beyond the baseline predictors.
+
+Use the same eligible population, chronological validation folds, and evaluation metrics for both configurations. Identify solicitation-response features explicitly and consistently. Avoid including future-looking variables, target-derived variables, or post-period information.
+
+Keep the modeling scope focused on evaluating solicitation-response features rather than attempting to build the group's final combined model. Clearly explain that the baseline comparison is used to assess the additional predictive contribution of solicitation-response features.
+
+**Rare-event classification**
+
+New major-donor conversions are extremely rare in this dataset. The previous modeling code retained every positive observation and sampled five negative observations per positive, resulting in a very small training sample. Reconsider whether this 5:1 negative sampling approach is appropriate.
+
+Evaluate whether a larger negative sample, class weighting, or using the full eligible training population would be more defensible for these algorithms. Do not automatically retain the existing approach. Favor a method that preserves useful information while remaining computationally practical.
+
+If negative sampling is used, apply it only within each training fold. Never sample or rebalance validation observations. Evaluate predictions against the complete eligible validation population. If sampling changes the training prevalence, address probability calibration or prior-probability correction appropriately, and explain the limitations.
+
+All imputation, preprocessing, transformations, sampling, and model tuning must be fitted exclusively on the training portion of each fold. Keep the evaluation temporally valid.
+
+Because the same constituents appear in multiple fiscal years, recognize that observations are not independent. The primary goal is prospective prediction for the existing constituent population, so preserve chronological separation and discuss the implications of repeated constituent observations.
+
+**Model evaluation**
+
+Evaluate the models using metrics appropriate for rare-event classification. Prioritize PR-AUC, precision and lift among the highest-ranked prospects, and the number of actual new major donors identified within the top 5%, 10%, and 20% of predicted prospects. Include ROC-AUC and Brier score as supplementary metrics where appropriate. Do not rely on accuracy as a primary metric.
+
+Report model performance separately for each validation fold. Also create a clear summary comparing performance across folds, algorithms, and feature configurations. Be careful when aggregating results across fiscal years, since the number of positive outcomes may differ substantially.
+
+For the final individual validation, explicitly report how well predictions made using FY2024 features identify actual FY2025 new major donors. Show how many true major-donor conversions are captured among the highest-ranked constituents, and whether adding solicitation-response features improves results relative to the baseline.
+
+Given the small number of positive outcomes, avoid overinterpreting minor performance differences. Discuss model instability, the limitations of rare-event prediction, and the distinction between predictive associations and causal solicitation effects.
+
+**Code readability and document organization**
+
+The existing `Modeling.qmd` was largely generated using Codex, and I want to make it substantially easier to read and understand. Organize the document into logical Quarto sections such as data preparation, target and eligibility definition, feature selection, temporal validation, model training, evaluation, model comparison, and conclusions.
+
+Use straightforward R code with descriptive variable names, short code chunks, and explanatory comments. Avoid excessive abstraction, deeply nested functions, complicated helper frameworks, unnecessary defensive checks, and large blocks of code that obscure the modeling process. Simple helper functions are acceptable when they genuinely reduce repetition, particularly for evaluating the same models across validation folds, but they should be easy to understand.
+
+Use clear tables and visualizations where they improve interpretation. Explain the reasoning behind important modeling decisions, including the chronological splits, feature configurations, treatment of class imbalance, and evaluation metrics. Keep the writing concise, professional, and appropriate for a graduate-level analytics report.
+
+Preserve existing working code, project structure, relative file paths, and naming conventions wherever possible. Do not introduce unnecessary dependencies.
+
+**Final verification**
+
+After implementing the changes, run the revised modeling workflow and render `Modeling.qmd` if the required data and dependencies are available. Verify that the target definition is consistent, the fiscal-year alignment is correct, the chronological folds work as intended, and the model evaluation tables are generated correctly.
+
+Confirm explicitly that FY2025 feature rows and FY2026 outcomes were not accessed for individual model development or evaluation. Confirm that FY2026 feature rows remain unlabeled.
+
+Finally, summarize the changes made to each file, explain the resulting modeling workflow, identify any unresolved issues, and describe the main findings from the individual model comparisons. Do not claim successful execution or validation of any step that could not actually be run.

@@ -216,6 +216,7 @@ def main() -> None:
 
     events = pd.concat([unite_events, legacy_events, soft_events], ignore_index=True)
     giving = events.groupby(["constituent_id", "fiscal_year"], as_index=False).sum()
+    # Annual giving combines direct payments and credited gifts for the target.
     giving["annual_giving"] = giving["direct_payment_amount"] + giving["soft_credit_amount"]
     del events, unite_events, legacy_events, soft_events, soft
     gc.collect()
@@ -273,11 +274,14 @@ def main() -> None:
     panel["giving_trend_vs_prior_fy"] = panel["annual_giving"] - panel["prior_fy_giving"]
     panel["trailing_3_fy_giving"] = panel["annual_giving"] + panel["prior_fy_giving"] + panel["two_fy_prior_giving"]
     panel["trailing_3_fy_gift_count"] = panel["direct_payment_count"] + grouped["direct_payment_count"].shift(1).fillna(0) + grouped["direct_payment_count"].shift(2).fillna(0)
+    # Align each constituent's following-year giving with the current feature year.
     panel["next_fy_giving"] = grouped["annual_giving"].shift(-1)
     panel["next_fy_reached_2000"] = (panel["next_fy_giving"] >= 2000).astype("Int64")
     panel.loc[panel["next_fy_giving"].isna(), "next_fy_reached_2000"] = pd.NA
     panel["next_fy_giving_growth"] = panel["next_fy_giving"] - panel["annual_giving"]
-    panel["major_donor_next_fy"] = ((panel["annual_giving"] < 2000) & panel["next_fy_giving"].between(2000, 15000)).astype("Int64")
+    # A new major donor crosses the $1,200 annual-giving threshold next FY.
+    panel["major_donor_next_fy"] = ((panel["annual_giving"] < 1200) & (panel["next_fy_giving"] >= 1200)).astype("Int64")
+    # Preserve unknown outcomes for the last fiscal year rather than labeling them negative.
     panel.loc[panel["next_fy_giving"].isna(), "major_donor_next_fy"] = pd.NA
     panel["data_split"] = panel["fiscal_year"].map(lambda y: "development" if y <= 2024 else ("final_test" if y == 2025 else "prediction"))
 
@@ -290,7 +294,7 @@ def main() -> None:
     assert panel.loc[panel["fiscal_year"] == 2026, "major_donor_next_fy"].isna().all()
     assert panel.loc[panel["fiscal_year"] < 2026, "major_donor_next_fy"].notna().all()
     assert panel.groupby("fiscal_year")["data_split"].first().to_dict() == {2021: "development", 2022: "development", 2023: "development", 2024: "development", 2025: "final_test", 2026: "prediction"}
-    expected = (panel["annual_giving"] < 2000) & panel["next_fy_giving"].between(2000, 15000)
+    expected = (panel["annual_giving"] < 1200) & (panel["next_fy_giving"] >= 1200)
     observed = panel["major_donor_next_fy"].notna()
     assert panel.loc[observed, "major_donor_next_fy"].astype(bool).eq(expected[observed]).all()
 

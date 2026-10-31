@@ -1,5 +1,5 @@
-﻿---
-title: "Solicitation-response contribution to donor prospect ranking"
+---
+title: "Predicting New Major Donors Using Solicitation Features"
 format:
   html:
     toc: true
@@ -9,245 +9,458 @@ execute:
   message: false
 ---
 
-## Design and boundaries
+## Objective and Data
 
-This analysis predicts `major_donor_next_fy` for constituents whose current
-annual giving is below $2,000, including zero. A positive outcome is $2,000–$15,000
-in the following July–June fiscal year. FY2021–FY2024 are development only:
-train on FY2021 and validate FY2022, then expand training through FY2022 and
-FY2023 to validate FY2023 and FY2024. Each validation outcome is observed in
-the following year. FY2025 features with FY2026 outcomes are reserved for final
-group testing; FY2026 is an unlabeled prediction cohort. Neither enters this
-analysis's model selection, preprocessing, or evaluation. The group should
-freeze its choices before using the final test; FY2026 needs FY2027 outcomes.
+The objective is to compare Logistic Regression, Elastic Net, Random Forest, and XGBoost for predicting which constituents will become new major donors. A new major donor is defined here as someone who gives less than **$1,200** in the feature year and at least **$1,200** in the following fiscal year. Annual giving includes direct payments and soft credits. The analysis includes only constituent-years eligible to cross this threshold.
 
-Within each fold, compare identical models and observations with and without
-solicitation-response variables. Campaign response is a **proxy**: the source
-records a same-constituent, same-code payment in the fiscal year, not proven
-causation. Campaign start dates are year markers, not contact dates. Current
-and trailing features are available by year end. Snapshot attributes,
-cultivation assignment, IDs, split markers, and all future outcomes are excluded.
+Each algorithm is evaluated twice: once using the available non-solicitation predictors and once with solicitation-response predictors added. The models are compared using chronological validation, with average precision as the primary performance metric because major-donor conversions are rare. FY2025 feature rows and FY2026 outcomes are reserved for the group's final combined-model evaluation.
+
+The solicitation-response measures require cautious interpretation. A response is identified through a same-constituent, same-marketing-code payment within the fiscal year; this is a proxy for response, not evidence that the solicitation caused the gift. Campaign dates identify fiscal years rather than verified contact dates.
 
 ```{r setup}
-#| include: false
-if (dir.exists(".r-lib")) .libPaths(c(normalizePath(".r-lib"), .libPaths()))
-required <- c("caret", "pROC", "randomForest", "glmnet", "xgboost", "dplyr",
-              "tidyr", "ggplot2", "readr", "foreach", "doParallel")
-missing_packages <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
-if (length(missing_packages)) stop("Install required R packages: ", paste(missing_packages, collapse = ", "))
 library(caret)
 library(dplyr)
 library(tidyr)
-library(ggplot2)
 library(readr)
-library(foreach)
-library(doParallel)
-set.seed(42)
+library(tibble)
+library(ggplot2)
+library(pROC)
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(gt)
+
+options(tibble.print_max = Inf, tibble.width = Inf)
+RANDOM_SEED <- 42
 ```
 
 ```{r data}
-analytic <- read_csv("Data_Files/constituent_fiscal_year_analytic.csv", show_col_types = FALSE)
-stopifnot(!anyDuplicated(analytic[c("constituent_id", "fiscal_year")]))
-stopifnot(all(is.na(analytic$major_donor_next_fy[analytic$fiscal_year == 2026])))
-stopifnot(all(analytic$data_split[analytic$fiscal_year == 2025] == "final_test"))
-stopifnot(all(analytic$data_split[analytic$fiscal_year == 2026] == "prediction"))
-# Retain only development data before any feature selection or summaries.
-dev <- analytic %>% filter(fiscal_year %in% 2021:2024, annual_giving < 2000,
-                           !is.na(major_donor_next_fy))
+# Load the analytic dataset
+analytic <- read_csv(
+  "Data_Files/constituent_fiscal_year_analytic.csv",
+  show_col_types = FALSE
+)
+
+# Keep eligible constituents from development years
+dev <- analytic %>%
+  filter(
+    fiscal_year %in% 2021:2024,
+    annual_giving < 1200,
+    !is.na(major_donor_next_fy)
+  )
+
+# Remove unfiltered data
 rm(analytic)
-# Use numeric donor characteristics only, with a strict outcome/identifier audit.
+```
+
+## Temporal Validation
+
+Three expanding-window folds test whether models trained on earlier years can predict outcomes in a later year. The first trains on FY2021 features and validates on FY2022 features (FY2023 outcomes); the second trains through FY2022 and validates on FY2023 features (FY2024 outcomes); the third trains through FY2023 and validates on FY2024 features (FY2025 outcomes). The outcome column already refers to giving in the following fiscal year, so no additional shift is needed. All three folds are used to compare models; the FY2025-feature/FY2026-outcome holdout is not used here.
+
+```{r folds}
+folds <- tibble(
+  fold = 1:3,
+  training_years = c("2021", "2021-2022", "2021-2023"),
+  feature_year = 2022:2024,
+  outcome_year = 2023:2025
+)
+
+gt(folds)
+```
+
+## Predictor Sets
+
+To isolate the predictive contribution of solicitation-response information, each model is fitted with two predictor sets on the same eligible constituent-years. The baseline excludes solicitation-related variables; the expanded set adds solicitation counts, response measures, campaign activity, and historical rates. Numeric predictors are selected after excluding identifiers, the target, future-year fields, and specified snapshot and cultivation fields. The comparison therefore tests whether the added solicitation variables improve predictions beyond the remaining predictors.
+
+```{r predictors}
+# Remove fields that could leak future information or identify a constituent.
 excluded <- grepl("^next_fy_|_snapshot$|^cultivation_", names(dev)) |
   names(dev) %in% c("constituent_id", "fiscal_year", "data_split", "major_donor_next_fy")
+
+# Keep numeric predictors and identify every solicitation-related feature.
 candidates <- names(dev)[!excluded & vapply(dev, is.numeric, logical(1))]
-solicitation <- candidates[grepl("^(solicitations|responses|campaign_|unique_campaigns_solicited|prior_fy_solicitations|prior_fy_campaign_responses|trailing_3_fy_solicitations|trailing_3_fy_campaign_responses|trailing_3_fy_response_rate)", candidates)]
-stopifnot(length(solicitation) > 0, !"major_donor_next_fy" %in% candidates,
-          !any(grepl("^next_fy_", candidates)))
-feature_sets <- list(without_solicitation = setdiff(candidates, solicitation),
-                     with_solicitation = candidates)
-tibble(feature = solicitation)
+solicitation <- candidates[grepl(
+  "^(solicitations|responses|campaign_|unique_campaigns_solicited|prior_fy_solicitations|prior_fy_campaign_responses|trailing_3_fy_solicitations|trailing_3_fy_campaign_responses|trailing_3_fy_response_rate)",
+  candidates
+)]
+
+# The two sets differ only in whether solicitation features are included.
+feature_sets <- list(
+  without_solicitation = setdiff(candidates, solicitation),
+  with_solicitation = candidates
+)
+
+gt(tibble(feature_set = names(feature_sets), predictors = lengths(feature_sets)))
 ```
 
-## Rolling validation and imbalance
+## Training Preparation
 
-The four algorithms use fixed, modest configurations to avoid expensive tuning
-on rare positives. Each fold downsamples training negatives to at most five per
-positive, keeping all positives; validation retains its natural prevalence. A
-prior-odds correction maps scores back to the training population prevalence.
-This correction assumes sampling depends only on the outcome; calibration must
-still be checked. Imputation and zero-variance filtering are fitted separately
-inside each training fold. The same sampled records are used in both feature
-sets. Results are development estimates, not final-test performance.
+Major-donor conversions are uncommon, so each training fold retains every positive case and randomly samples up to 50 negative cases per positive case to reduce computation. Validation always uses every eligible observation, preserving the actual outcome frequency. Missing predictor values are replaced with medians calculated from the sampled training data, and predictors that are constant in that sample are removed. These preprocessing decisions are then applied to the validation data.
 
-```{r helpers}
-folds <- list(`2022` = 2021L, `2023` = 2021:2022, `2024` = 2021:2023)
-models <- c("Logistic regression", "Elastic Net", "Random Forest", "XGBoost")
+Because negative sampling changes the proportion of positive cases used for fitting, predicted probabilities are adjusted for the difference between sampled and original training prevalence. This adjustment does not guarantee well-calibrated probabilities, particularly for ensemble models.
 
-fit_fold <- function(train, valid, features, model_name, seed) {
-  set.seed(seed)
-  y <- train$major_donor_next_fy
-  if (length(unique(y)) != 2 || length(unique(valid$major_donor_next_fy)) != 2)
-    stop("Each fold must contain both outcome classes")
-  # Training-only preprocessing, before negative sampling.
-  x <- as.data.frame(train[, features, drop = FALSE])
-  v <- as.data.frame(valid[, features, drop = FALSE])
-  medians <- vapply(x, function(z) if (all(is.na(z))) 0 else median(z, na.rm = TRUE), numeric(1))
-  for (j in seq_along(x)) {
-    x[[j]][is.na(x[[j]])] <- medians[j]
-    v[[j]][is.na(v[[j]])] <- medians[j]
-  }
-  keep <- vapply(x, function(z) length(unique(z)) > 1, logical(1))
-  x <- x[, keep, drop = FALSE]; v <- v[, keep, drop = FALSE]
-  pos <- which(y == 1); neg <- which(y == 0)
-  selected <- c(pos, sample(neg, min(length(neg), 5L * length(pos))))
-  x <- x[selected, , drop = FALSE]
-  sampled_y <- factor(ifelse(y[selected] == 1, "yes", "no"), levels = c("yes", "no"))
-  population_prior <- mean(y == 1); sample_prior <- mean(y[selected] == 1)
-  control <- trainControl(method = "none", classProbs = TRUE, allowParallel = FALSE)
-  if (model_name == "Logistic regression") {
-    fit <- train(x, sampled_y, method = "glm", family = binomial(), trControl = control)
-  } else if (model_name == "Elastic Net") {
-    fit <- train(x, sampled_y, method = "glmnet", family = "binomial",
-                 preProcess = c("center", "scale"),
-                 tuneGrid = data.frame(alpha = 0.5, lambda = 0.01), trControl = control)
-  } else if (model_name == "Random Forest") {
-    fit <- train(x, sampled_y, method = "rf", ntree = 200,
-                 tuneGrid = data.frame(mtry = max(1L, floor(sqrt(ncol(x))))),
-                 importance = TRUE, trControl = control)
-  } else {
-    fit <- xgboost::xgb.train(
-      data = xgboost::xgb.DMatrix(as.matrix(x), label = as.integer(sampled_y == "yes")),
-      params = list(objective = "binary:logistic", max_depth = 3, eta = 0.05,
-                    colsample_bytree = 0.8, subsample = 0.8, nthread = 1),
-      nrounds = 100, verbose = 0)
-  }
-  prob <- if (model_name == "XGBoost") predict(fit, as.matrix(v)) else
-    predict(fit, newdata = v, type = "prob")$yes
-  prob <- pmin(pmax(prob, 1e-8), 1 - 1e-8)
-  corrected <- plogis(qlogis(prob) + qlogis(population_prior) - qlogis(sample_prior))
-  importance <- tryCatch({
-    if (model_name == "XGBoost") {
-      z <- xgboost::xgb.importance(model = fit)
-      data.frame(feature = z$Feature, importance = z$Gain)
-    } else {
-      z <- varImp(fit, scale = FALSE)$importance
-      data.frame(feature = rownames(z), importance = rowMeans(z))
+```{r preparation}
+prepare_features <- function(columns, train_data, valid_data, sampled_rows) {
+
+  # Select the same predictors for training and validation
+  x_train <- train_data[sampled_rows, columns, drop = FALSE]
+  x_valid <- valid_data[, columns, drop = FALSE]
+
+  # Replace missing values using training medians
+  for (column in columns) {
+    median_value <- median(x_train[[column]], na.rm = TRUE)
+
+    if (!is.finite(median_value)) {
+      median_value <- 0
     }
-  }, error = function(e) data.frame(feature = character(), importance = numeric()))
-  list(predictions = data.frame(constituent_id = valid$constituent_id,
-       fiscal_year = valid$fiscal_year, outcome = valid$major_donor_next_fy,
-       probability = corrected), importance = importance)
+
+    x_train[[column]][is.na(x_train[[column]])] <- median_value
+    x_valid[[column]][is.na(x_valid[[column]])] <- median_value
+  }
+
+  # Remove predictors that are constant in the training sample
+  varying <- vapply(
+    x_train,
+    function(x) length(unique(x)) > 1,
+    logical(1)
+  )
+
+  x_train <- x_train[, varying, drop = FALSE]
+  x_valid <- x_valid[, varying, drop = FALSE]
+
+  list(train = x_train, valid = x_valid)
 }
 
-# Average precision is the step-wise area under the precision-recall curve.
-metrics <- function(d) {
-  d <- d[order(-d$probability, d$constituent_id), ]
-  y <- d$outcome; n <- length(y); positives <- sum(y); prevalence <- mean(y)
-  precision <- cumsum(y) / seq_len(n)
-  ap <- sum(precision[y == 1]) / positives
-  roc <- as.numeric(pROC::auc(pROC::roc(y, d$probability, levels = c(0, 1), quiet = TRUE)))
-  top <- lapply(c(.05, .10, .20), function(fraction) {
-    k <- ceiling(n * fraction); p <- mean(y[seq_len(k)])
-    data.frame(fraction = fraction, k = k, precision = p, lift = p / prevalence)
-  })
-  list(summary = data.frame(n = n, positives = positives, prevalence = prevalence,
-       pr_auc = ap, roc_auc = roc, brier = mean((d$probability - y)^2),
-       mean_probability = mean(d$probability)), top = bind_rows(top))
+# Adjust scores for the training sample's altered class proportions.
+correct_probability <- function(probability, population_prior, sample_prior) {
+  probability <- pmin(pmax(as.numeric(probability), 1e-8), 1 - 1e-8)
+  plogis(qlogis(probability) + qlogis(population_prior) - qlogis(sample_prior))
 }
 ```
 
-```{r run}
-# Two workers limit memory when Windows serializes data to worker processes.
-workers <- min(2L, max(1L, parallel::detectCores() - 1L))
-cluster <- parallel::makeCluster(workers)
-parallel::clusterCall(cluster, function(paths) .libPaths(paths), .libPaths())
-registerDoParallel(cluster)
-jobs <- expand.grid(validation_year = as.integer(names(folds)),
-                    feature_set = names(feature_sets), model = models,
-                    stringsAsFactors = FALSE)
-results <- tryCatch(foreach(i = seq_len(nrow(jobs)), .packages = c("caret", "dplyr"),
-                   .export = c("fit_fold", "folds", "feature_sets", "dev", "jobs"),
-                   .errorhandling = "stop") %dopar% {
-  job <- jobs[i, ]
-  fit_fold(dev[dev$fiscal_year %in% folds[[as.character(job$validation_year)]], ],
-           dev[dev$fiscal_year == job$validation_year, ],
-           feature_sets[[job$feature_set]], job$model, 1000L + job$validation_year)
-}, finally = { parallel::stopCluster(cluster); registerDoSEQ() })
-predictions <- bind_rows(lapply(seq_along(results), function(i)
-  cbind(jobs[i, ], results[[i]]$predictions)))
-importance <- bind_rows(lapply(seq_along(results), function(i)
-  cbind(jobs[rep(i, nrow(results[[i]]$importance)), , drop = FALSE], results[[i]]$importance)))
+## Model Training
+
+Four classification algorithms are compared: Logistic Regression as a conventional benchmark, Elastic Net as a regularized regression model, Random Forest as a bagged tree ensemble, and XGBoost as a boosted tree ensemble. Each algorithm is fitted separately for both predictor sets in every temporal fold, producing 24 model fits in total. The hyperparameters are fixed rather than optimized through an additional tuning procedure. Elastic Net uses centered and scaled predictors; the other models use the imputed predictors directly.
+
+```{r models}
+# Fixed model settings for benchmark comparisons
+control <- trainControl(
+  method = "none",
+  classProbs = TRUE,
+  allowParallel = FALSE
+)
+
+fit_models <- function(x_train, x_valid, y_train) {
+
+  # Remove linearly dependent predictors for ordinary logistic regression
+  design <- cbind(Intercept = 1, as.matrix(x_train))
+  independent <- qr(design)$pivot[seq_len(qr(design)$rank)]
+  glm_columns <- setdiff(colnames(design)[independent], "Intercept")
+
+  # Logistic regression
+  set.seed(RANDOM_SEED)
+
+  logistic <- train(
+    x = x_train[, glm_columns, drop = FALSE],
+    y = y_train,
+    method = "glm",
+    family = binomial(),
+    trControl = control
+  )
+
+  # Elastic net logistic regression
+  set.seed(RANDOM_SEED)
+
+  elastic <- train(
+    x = x_train,
+    y = y_train,
+    method = "glmnet",
+    family = "binomial",
+    preProcess = c("center", "scale"),
+    tuneGrid = data.frame(
+      alpha = 0.5,
+      lambda = 0.01
+    ),
+    trControl = control
+  )
+
+  # Random forest
+  set.seed(RANDOM_SEED)
+
+  forest <- train(
+    x = x_train,
+    y = y_train,
+    method = "rf",
+    ntree = 200,
+    tuneGrid = data.frame(
+      mtry = max(1, floor(sqrt(ncol(x_train))))
+    ),
+    trControl = control
+  )
+
+  # XGBoost
+  set.seed(RANDOM_SEED)
+
+  boost <- xgboost::xgb.train(
+    data = xgboost::xgb.DMatrix(
+      as.matrix(x_train),
+      label = as.integer(y_train == "yes")
+    ),
+    params = list(
+      objective = "binary:logistic",
+      max_depth = 3,
+      eta = 0.05,
+      colsample_bytree = 0.8,
+      subsample = 0.8,
+      nthread = 1
+    ),
+    nrounds = 100,
+    verbose = 0
+  )
+
+  # Predict probabilities on the full validation population
+  list(
+    `Logistic Regression` = predict(
+      logistic,
+      x_valid[, glm_columns, drop = FALSE],
+      type = "prob"
+    )$yes,
+
+    `Elastic Net` = predict(
+      elastic, x_valid, type = "prob"
+    )$yes,
+
+    `Random Forest` = predict(
+      forest, x_valid, type = "prob"
+    )$yes,
+
+    XGBoost = predict(
+      boost,
+      xgboost::xgb.DMatrix(as.matrix(x_valid))
+    )
+  )
+}
 ```
 
-## Performance comparisons
+```{r predictions}
+#| label: predictions
+
+predictions <- bind_rows(lapply(1:3, function(fold) {
+
+  # Select training and validation years
+  train_data <- dev %>%
+    filter(fiscal_year < folds$feature_year[fold])
+
+  valid_data <- dev %>%
+    filter(fiscal_year == folds$feature_year[fold])
+
+  # Identify positive and negative training observations
+  y_full <- train_data$major_donor_next_fy
+
+  positive <- which(y_full == 1)
+  negative <- which(y_full == 0)
+
+  # Keep every positive and sample up to 50 negatives per positive
+  set.seed(RANDOM_SEED + fold)
+
+  sampled_rows <- sort(c(
+    positive,
+    sample(
+      negative,
+      min(length(negative), 50L * length(positive))
+    )
+  ))
+
+  # Create training outcome
+  y_train <- factor(
+    ifelse(y_full[sampled_rows] == 1, "yes", "no"),
+    levels = c("yes", "no")
+  )
+
+  # Calculate class proportions for probability correction
+  population_prior <- mean(y_full == 1)
+  sample_prior <- mean(y_full[sampled_rows] == 1)
+
+  # Compare models with and without solicitation features
+  bind_rows(lapply(names(feature_sets), function(feature_set) {
+
+    features <- prepare_features(
+      feature_sets[[feature_set]],
+      train_data,
+      valid_data,
+      sampled_rows
+    )
+
+    # Fit four models and predict validation outcomes
+    scores <- fit_models(
+      features$train,
+      features$valid,
+      y_train
+    )
+
+    # Store predictions for each model
+    bind_rows(lapply(names(scores), function(model) {
+
+      corrected <- correct_probability(
+        scores[[model]],
+        population_prior,
+        sample_prior
+      )
+
+      tibble(
+        fold = fold,
+        feature_year = folds$feature_year[fold],
+        outcome_year = folds$outcome_year[fold],
+        model = model,
+        feature_set = feature_set,
+        outcome = valid_data$major_donor_next_fy,
+        probability = corrected
+      )
+    }))
+  }))
+}))
+```
+
+## Evaluate Predictions
+
+Each fitted model generates predicted probabilities for the full validation year, which are compared with observed next-year major-donor conversions. **Average precision** is the primary selection metric because it evaluates how effectively a model ranks rare positive cases. ROC AUC summarizes discrimination between positive and negative cases, while the Brier score measures squared probability error (lower is better). The counts captured in the top 5%, 10%, and 20% show how many eventual major donors would be identified by prioritizing the highest-ranked constituents. These capture counts are calculated for each fold, although the main summary table below focuses on average precision, ROC AUC, and Brier score.
 
 ```{r evaluation}
-groups <- split(predictions, interaction(predictions$model, predictions$feature_set,
-                                        predictions$validation_year, drop = TRUE))
-evaluated <- lapply(groups, function(d) {
-  m <- metrics(d)
-  keys <- d[1, c("model", "feature_set", "validation_year")]
-  list(summary = cbind(keys, m$summary), top = cbind(keys, m$top))
-})
-fold_metrics <- bind_rows(lapply(evaluated, `[[`, "summary"))
-top_metrics <- bind_rows(lapply(evaluated, `[[`, "top"))
-fold_metrics %>% arrange(validation_year, model, feature_set) %>% as.data.frame()
-top_metrics %>% arrange(validation_year, model, feature_set, fraction) %>% as.data.frame()
+score_model <- function(data) {
+
+  # Rank constituents by predicted probability
+  ranked <- data %>% arrange(desc(probability))
+
+  outcomes <- ranked$outcome
+  n <- nrow(ranked)
+  positives <- sum(outcomes)
+
+  # Precision at each rank
+  precision <- cumsum(outcomes) / seq_len(n)
+
+  # Number of constituents in each top-ranked group
+  top_5 <- ceiling(0.05 * n)
+  top_10 <- ceiling(0.10 * n)
+  top_20 <- ceiling(0.20 * n)
+
+  tibble(
+    average_precision = if (positives > 0) {
+      sum(precision * outcomes) / positives
+    } else NA_real_,
+
+    roc_auc = if (length(unique(outcomes)) == 2) {
+      as.numeric(pROC::auc(pROC::roc(
+        outcomes, ranked$probability,
+        levels = c(0, 1),
+        direction = "<",
+        quiet = TRUE
+      )))
+    } else NA_real_,
+
+    brier = mean((ranked$probability - outcomes)^2),
+
+    captured_top_5pct = sum(head(outcomes, top_5)),
+    captured_top_10pct = sum(head(outcomes, top_10)),
+    captured_top_20pct = sum(head(outcomes, top_20))
+  )
+}
+
+# Evaluate each model separately within each validation fold
+comparison <- predictions %>%
+  group_by(fold, feature_year, outcome_year, model, feature_set) %>%
+  group_modify(~ score_model(.x)) %>%
+  ungroup()
 ```
 
-```{r comparison-plots}
-ggplot(fold_metrics, aes(factor(validation_year), pr_auc, color = feature_set, group = feature_set)) +
-  geom_point() + geom_line() + facet_wrap(~model) + labs(x = "Validation feature FY", y = "Average precision (PR AUC)", color = "Features") + theme_minimal()
-ggplot(top_metrics, aes(factor(fraction), lift, fill = feature_set)) +
-  geom_col(position = "dodge") + facet_grid(model ~ validation_year) +
-  labs(x = "Top share", y = "Lift over validation prevalence", fill = "Features") + theme_minimal()
+## Model Comparison
+
+The comparison table summarizes all **eight model configurations**: four algorithms, each with and without solicitation-response predictors. Each metric is averaged equally across the three chronological validation folds, and the configurations are sorted from highest to lowest mean average precision. These fold averages provide a concise comparison, although performance may differ by year and the folds have different numbers of conversions.
+
+In the results, **XGBoost with solicitation-response features** achieved the highest mean average precision (approximately **0.192**), narrowly ahead of Random Forest with solicitation features (approximately **0.188**). XGBoost's fold-level performance varied, however, so this ranking should not be interpreted as evidence that it will outperform every alternative in every future year.
+
+```{r model-comparison}
+model_summary <- comparison %>%
+  group_by(model, feature_set) %>%
+  summarise(
+    mean_precision = mean(average_precision, na.rm = TRUE),
+    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
+    mean_brier = mean(brier, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_precision))
+
+model_summary %>%
+  gt() %>%
+  fmt_number(
+    columns = c(mean_precision, mean_roc_auc),
+    decimals = 3
+  ) %>%
+  fmt_number(columns = mean_brier, decimals = 6)
 ```
 
-```{r paired-differences}
-fold_metrics %>% select(model, validation_year, feature_set, pr_auc, roc_auc, brier) %>%
-  pivot_wider(names_from = feature_set, values_from = c(pr_auc, roc_auc, brier)) %>%
-  mutate(delta_pr_auc = pr_auc_with_solicitation - pr_auc_without_solicitation,
-         delta_roc_auc = roc_auc_with_solicitation - roc_auc_without_solicitation,
-         delta_brier = brier_with_solicitation - brier_without_solicitation) %>%
-  arrange(model, validation_year) %>% as.data.frame()
+## Best-Performing Models
+
+This table identifies the algorithm and feature configuration with the best mean score for each evaluation metric across the three folds. Higher average precision and ROC AUC are preferred, while lower Brier score is preferred. The winning configuration can differ across metrics, so average precision is used to guide the primary model choice rather than requiring a single model to lead on every measure.
+
+```{r best-models}
+best_models <- model_summary %>%
+  select(
+    model,
+    feature_set,
+    mean_precision,
+    mean_roc_auc,
+    mean_brier
+  ) %>%
+  pivot_longer(
+    cols = starts_with("mean_"),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  group_by(metric) %>%
+  slice_max(
+    order_by = if_else(metric == "mean_brier", -value, value),
+    n = 1,
+    with_ties = TRUE
+  ) %>%
+  ungroup() %>%
+  arrange(metric)
+
+best_models %>%
+  gt() %>%
+  fmt_number(columns = value, decimals = 4)
 ```
 
-## Calibration and feature importance
+## Solicitation-Response Feature Importance
 
-Calibration uses equal-count score bins within each model, feature set and
-validation year. Brier score and mean prediction versus prevalence are reported
-above. Bins can contain very few positives; calibration is descriptive and the
-prior correction is not a substitute for independent calibration.
+Because XGBoost with solicitation-response features had the highest mean average precision and ROC AUC, its feature importance is examined to understand which solicitation-related predictors it uses most. Importance is measured by **gain**, the relative improvement in XGBoost's training objective associated with splits using a predictor. The plot shows solicitation-related features ranked by gain within the model that also includes non-solicitation predictors. It does not show the direction of each predictor's relationship with the outcome.
 
-```{r calibration}
-calibration <- predictions %>% group_by(model, feature_set, validation_year) %>%
-  mutate(bin = ntile(probability, 10)) %>% group_by(model, feature_set, validation_year, bin) %>%
-  summarise(n = n(), predicted = mean(probability), observed = mean(outcome), .groups = "drop")
-ggplot(calibration, aes(predicted, observed, color = feature_set)) +
-  geom_abline(slope = 1, intercept = 0, linetype = 2) + geom_point(aes(size = n)) +
-  facet_grid(model ~ validation_year, scales = "free") +
-  labs(x = "Mean predicted probability", y = "Observed rate", color = "Features") + theme_minimal()
+```{r variable-importance} id="vxq82a"
+# Identify solicitation features used by XGBoost
+solicitation_importance <- importance %>%
+  filter(Feature %in% solicitation) %>%
+  arrange(desc(Gain))
+
+# Plot solicitation features by importance
+ggplot(
+  solicitation_importance,
+  aes(x = reorder(Feature, Gain), y = Gain)
+) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "XGBoost Solicitation Feature Importance",
+    x = NULL,
+    y = "Gain"
+  ) +
+  theme_minimal()
 ```
 
-```{r importance}
-# Importance scales differ between algorithms; compare within a model/fold only.
-importance %>% filter(feature_set == "with_solicitation") %>%
-  group_by(model, validation_year) %>% slice_max(importance, n = 12, with_ties = FALSE) %>%
-  ungroup() %>% arrange(model, validation_year, desc(importance)) %>% as.data.frame()
-```
+The highest-ranked solicitation-related predictors were **trailing three-year solicitations**, **prior-year solicitations**, and **trailing three-year response rate**. Solicitation volume measures ranked above most individual response and campaign variables. This indicates that historical solicitation activity contains information the fitted XGBoost model uses, but it does not establish that more solicitations lead to higher future giving.
 
-## Interpretation and limitations
+The solicitation features have relatively small individual gain values compared with the dominant giving-history predictors in the full model. Importance also can be shared across correlated variables, so a low gain value does not necessarily mean a feature has no predictive value. The stronger test of the solicitation feature set is whether XGBoost performs better on held-out years when those variables are included.
 
-Focus on paired differences by year, especially precision and lift at realistic
-staff capacity. Class imbalance makes ROC AUC alone misleading. Few positive
-outcomes make fold metrics and importance unstable; assess uncertainty and
-repeatability before operational use. Importance is model-specific, not causal,
-and correlated giving and solicitation variables can share importance. The
-fixed model settings are a computational baseline, not exhaustive tuning.
-Random downsampling and prior correction may still produce poorly calibrated
-scores; temporal drift and repeated constituents across years affect evaluation.
-All data are synthetic, with release-specific cleaning and placeholder fields.
-A later final-group workflow should freeze model and features, fit on development
-years, and evaluate FY2025 once; FY2026 can only be scored until FY2027 labels
-are available. Do not interpret these results as an estimate of the causal effect
-of solicitation or of the cultivation program.
+## Conclusion
 
+Across the three chronological validation folds, **XGBoost with solicitation-response predictors** achieved the highest mean average precision of the eight configurations evaluated. The benefit of including solicitation features was not consistent across years: XGBoost's average precision improved in the FY2023 and FY2025 outcome validations but declined in FY2024. Random Forest showed more consistent gains from including solicitation features across all three folds.
+
+The variable importance results indicate that XGBoost uses historical solicitation volume and response rates, although historical giving is substantially more influential overall. These findings support treating solicitation-response features as potentially useful supplementary predictors, not as evidence of a causal effect of outreach. The selected configuration should be regarded as the strongest **development-stage candidate**, with the FY2025-feature/FY2026-outcome holdout preserved for the group's combined-model evaluation.
