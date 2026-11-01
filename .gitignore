@@ -27,8 +27,5 @@ Thumbs.db
 *.csv
 passport_viewing.txt
 
-# Excel
-*.xlsx
-
 # Word Documents
 *.docx

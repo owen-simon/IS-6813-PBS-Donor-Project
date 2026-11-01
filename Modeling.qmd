@@ -11,9 +11,9 @@ execute:
 
 ## Objective and Data
 
-The objective is to compare Logistic Regression, Elastic Net, Random Forest, and XGBoost for predicting which constituents will cross the major-donor threshold in the following fiscal year. A new major donor is defined here as someone who gives less than **$1,200** in the feature year and at least **$1,200** in the following fiscal year. Annual giving includes direct payments and soft credits. The analysis includes only constituent-years eligible to cross this threshold.
+The objective is to evaluate whether historical solicitation-response features provide additional predictive information for identifying constituents likely to cross the major-donor threshold in the following fiscal year. Four classification algorithms, Logistic Regression, Elastic Net, Random Forest, and XGBoost, are used to assess the incremental predictive value of these features. The findings will inform which solicitation-related predictors should be considered for inclusion in the group's final combined prediction model.
 
-Each algorithm is evaluated twice: once using the available non-solicitation predictors and once with solicitation-response predictors added. The models are compared using chronological validation, with average precision as the primary performance metric because major-donor conversions are rare. FY2025 feature rows and FY2026 outcomes are reserved for the group's final combined-model evaluation.
+Crossing the major-donor threshold is defined as giving less than **$1,200** in the feature year and at least **$1,200** in the following fiscal year. Each algorithm is evaluated twice: once using a baseline set of non-solicitation predictors and once with solicitation-response predictors added. The models are compared using expanding-window cross-validation, with average precision as the primary performance metric because major-donor conversions are rare. FY2025 feature rows and FY2026 outcomes are reserved for the group's final combined-model evaluation.
 
 The solicitation-response measures require cautious interpretation. A response is identified through a same-constituent, same-marketing-code payment within the fiscal year; this is a proxy for response, not evidence that the solicitation caused the gift. Campaign dates identify fiscal years rather than verified contact dates.
 
@@ -37,7 +37,7 @@ options(tibble.print_max = Inf, tibble.width = Inf)
 RANDOM_SEED <- 42
 ```
 
-```{r data}
+```{r load_data}
 # Load the analytic dataset
 analytic <- read_csv(
   "Data_Files/constituent_fiscal_year_analytic.csv",
@@ -113,7 +113,7 @@ Major-donor conversions are uncommon, so each training fold retains every positi
 
 Because negative sampling changes the proportion of positive cases used for fitting, predicted probabilities are adjusted using the difference between sampled and original training prevalence. This correction preserves the ranking of predictions but does not guarantee well-calibrated probabilities, particularly for ensemble models.
 
-```{r preparation}
+```{r training_prep}
 prepare_features <- function(columns, train_data, valid_data, sampled_rows) {
 
   # Select the same predictors for training and validation
@@ -350,7 +350,7 @@ predictions <- bind_rows(lapply(seq_len(nrow(folds)), function(fold) {
 
 ## Model Evaluation and Comparison
 
-Each model's predictions are evaluated against observed next-year major-donor conversions using average precision, ROC AUC, and Brier score. **Average precision** is the primary selection metric because it measures how effectively a model ranks rare positive cases. ROC AUC measures discrimination between positive and negative cases, while the Brier score measures squared probability error (lower is better). The number and percentage of eventual major donors captured within the top 5%, 10%, and 20% of ranked constituents are also calculated to assess potential usefulness for donor prioritization.
+Each model's predictions are evaluated against observed next-year major-donor conversions using average precision, ROC AUC, and Brier score. **Average precision** is the primary selection metric because it measures how effectively a model ranks rare positive cases. ROC AUC measures discrimination between positive and negative cases, while the Brier score measures squared probability error (lower is better).
 
 ```{r evaluation}
 score_model <- function(data) {
@@ -444,18 +444,18 @@ Performance is compared across eight model configurations: four algorithms, each
 model_summary <- comparison %>%
   group_by(model, feature_set) %>%
   summarise(
-    mean_precision = mean(average_precision, na.rm = TRUE),
+    mean_ap = mean(average_precision, na.rm = TRUE),
     mean_roc_auc = mean(roc_auc, na.rm = TRUE),
     mean_brier = mean(brier, na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  arrange(desc(mean_precision))
+  arrange(desc(mean_ap))
 
 # Display model comparison
 model_summary %>%
   gt() %>%
   fmt_number(
-    columns = c(mean_precision, mean_roc_auc),
+    columns = c(mean_ap, mean_roc_auc),
     decimals = 3
   ) %>%
   fmt_number(
@@ -477,7 +477,7 @@ best_models <- model_summary %>%
   select(
     model,
     feature_set,
-    mean_precision,
+    mean_ap,
     mean_roc_auc,
     mean_brier
   ) %>%
@@ -504,9 +504,11 @@ XGBoost with solicitation-response predictors achieved the best mean performance
 
 ## Solicitation-Response Feature Importance
 
-Because XGBoost with solicitation-response predictors achieved the highest mean average precision during temporal validation, an additional XGBoost model is fitted using all FY2021–FY2024 development data. The model uses the same preprocessing, negative sampling strategy, and hyperparameters as the validation models.
+Because XGBoost with solicitation-response predictors achieved the highest mean average precision during temporal validation, it is used to examine which solicitation-related features contribute most to prediction. An additional XGBoost model is fitted using all FY2021–FY2024 development data, with the same preprocessing, negative sampling strategy, and hyperparameters as the validation models.
 
 Feature importance is measured using **gain**, which represents the relative improvement in XGBoost's training objective associated with splits using each predictor. The first plot displays feature importance across all predictors, while the second focuses specifically on solicitation-related predictors. Both plots use gain values from the same fitted model, allowing their relative contributions to be compared directly.
+
+These importance measures help identify solicitation-related features for consideration in the group's combined prediction model, but do not establish their independent predictive value or guarantee their usefulness alongside additional predictors.
 
 ```{r variable-importance}
 # Identify positive and negative development observations
@@ -576,7 +578,7 @@ ggplot(
   theme_minimal()
 ```
 
-The all-features plot shows that historical giving is substantially more influential than solicitation activity. **Trailing three-year giving**, **annual giving**, and **prior-year giving** are the three most important predictors, with trailing three-year giving contributing the greatest gain. This suggests that historical giving behavior is the strongest source of predictive information in the fitted model.
+The all-features plot shows that historical giving is substantially more influential than solicitation activity. **Trailing three-year giving**, **annual giving**, and **prior-year giving** are the three most important predictors, with trailing three-year giving contributing the greatest gain. This makes sense given that constituents with a history of higher and more consistent giving are likely to be stronger candidates for future major-donor conversions.
 
 ```{r}
 # Identify solicitation-related features
@@ -604,15 +606,12 @@ Among solicitation-related predictors, **trailing three-year solicitations** has
 
 However, the importance of individual solicitation predictors remains relatively small compared with the dominant giving-history variables. Correlated predictors may share importance, and gain does not establish the direction or causal effect of a predictor's relationship with future giving. The incremental predictive value of solicitation-response information is therefore better assessed through the held-out validation comparisons than through feature importance alone.
 
-
 ## Conclusion
 
-Across three chronological validation folds, XGBoost with solicitation-response predictors achieved the highest mean average precision (0.192), ROC AUC (0.941), and lowest mean Brier score (0.000233) among the eight model configurations. Adding solicitation features increased XGBoost's mean average precision from 0.184 to 0.192, suggesting a modest improvement in identifying constituents likely to cross the major-donor threshold.
+Across three chronological validation folds, adding historical solicitation-response features modestly improved predictive performance, particularly for tree-based models. XGBoost average precision increased from 0.184 to 0.192, suggesting that solicitation history provides additional predictive information beyond historical giving behavior.
 
-The benefit of solicitation-response predictors varied by algorithm. Random Forest also improved with these features, while Elastic Net showed little change and Logistic Regression performed worse. This suggests that the additional predictive information may be better captured by nonlinear tree-based models.
+Feature importance identified trailing three-year solicitation count, campaign response rate, and digital solicitation activity as the most informative solicitation-related predictors. However, historical giving remained the dominant source of predictive information.
 
-Feature importance indicates that historical giving behavior is the dominant source of predictive information. Trailing three-year giving, annual giving, and prior-year giving were the most influential predictors. Among solicitation-related features, trailing three-year solicitations contributed the most, followed by campaign response rate and digital solicitation activity.
+These findings support carrying solicitation-response features forward for evaluation in the group's combined major-donor prediction model. Their incremental contribution should be reassessed alongside the additional features developed by other group members, since some solicitation variables may contain overlapping information.
 
-Overall, solicitation-response features appear to provide useful supplementary predictive information, although their contribution is relatively modest compared with giving history. These associations should not be interpreted as evidence that solicitation activity causes increased giving, particularly because solicitation responses are identified using payment-based proxies.
-
-**XGBoost with solicitation-response predictors is recommended as the leading development-stage model.** However, this recommendation is based on three temporal validation folds and fixed hyperparameters rather than a comprehensive tuning procedure. The FY2025-feature/FY2026-outcome holdout remains reserved for evaluating the group's combined model using all available feature groups.
+Overall, historical solicitation activity appears to provide modest supplementary predictive value for identifying potential future major donors, although these associations do not establish that solicitation activity *causes* increased giving.

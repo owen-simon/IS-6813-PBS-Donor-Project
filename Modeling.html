@@ -2248,8 +2248,8 @@ vertical-align: -.125em;
 
 <section id="objective-and-data" class="level2">
 <h2 class="anchored" data-anchor-id="objective-and-data">Objective and Data</h2>
-<p>The objective is to compare Logistic Regression, Elastic Net, Random Forest, and XGBoost for predicting which constituents will cross the major-donor threshold in the following fiscal year. A new major donor is defined here as someone who gives less than <strong>$1,200</strong> in the feature year and at least <strong>$1,200</strong> in the following fiscal year. Annual giving includes direct payments and soft credits. The analysis includes only constituent-years eligible to cross this threshold.</p>
-<p>Each algorithm is evaluated twice: once using the available non-solicitation predictors and once with solicitation-response predictors added. The models are compared using chronological validation, with average precision as the primary performance metric because major-donor conversions are rare. FY2025 feature rows and FY2026 outcomes are reserved for the group’s final combined-model evaluation.</p>
+<p>The objective is to evaluate whether historical solicitation-response features provide additional predictive information for identifying constituents likely to cross the major-donor threshold in the following fiscal year. Four classification algorithms, Logistic Regression, Elastic Net, Random Forest, and XGBoost, are used to assess the incremental predictive value of these features. The findings will inform which solicitation-related predictors should be considered for inclusion in the group’s final combined prediction model.</p>
+<p>Crossing the major-donor threshold is defined as giving less than <strong>$1,200</strong> in the feature year and at least <strong>$1,200</strong> in the following fiscal year. Each algorithm is evaluated twice: once using a baseline set of non-solicitation predictors and once with solicitation-response predictors added. The models are compared using expanding-window cross-validation, with average precision as the primary performance metric because major-donor conversions are rare. FY2025 feature rows and FY2026 outcomes are reserved for the group’s final combined-model evaluation.</p>
 <p>The solicitation-response measures require cautious interpretation. A response is identified through a same-constituent, same-marketing-code payment within the fiscal year; this is a proxy for response, not evidence that the solicitation caused the gift. Campaign dates identify fiscal years rather than verified contact dates.</p>
 </section>
 <section id="setup" class="level2">
@@ -2304,20 +2304,20 @@ vertical-align: -.125em;
 <span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="fu">gt</span>(folds)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <div class="cell-output-display">
-<div id="cqgrkectjv" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#cqgrkectjv table {
+<div id="ptxpcuwshg" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#ptxpcuwshg table {
 font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
 -webkit-font-smoothing: antialiased;
 -moz-osx-font-smoothing: grayscale;
 }
-#cqgrkectjv thead, #cqgrkectjv tbody, #cqgrkectjv tfoot, #cqgrkectjv tr, #cqgrkectjv td, #cqgrkectjv th {
+#ptxpcuwshg thead, #ptxpcuwshg tbody, #ptxpcuwshg tfoot, #ptxpcuwshg tr, #ptxpcuwshg td, #ptxpcuwshg th {
 border-style: none;
 }
-#cqgrkectjv p {
+#ptxpcuwshg p {
 margin: 0;
 padding: 0;
 }
-#cqgrkectjv .gt_table {
+#ptxpcuwshg .gt_table {
 display: table;
 border-collapse: collapse;
 line-height: normal;
@@ -2342,11 +2342,11 @@ border-left-style: none;
 border-left-width: 2px;
 border-left-color: #D3D3D3;
 }
-#cqgrkectjv .gt_caption {
+#ptxpcuwshg .gt_caption {
 padding-top: 4px;
 padding-bottom: 4px;
 }
-#cqgrkectjv .gt_title {
+#ptxpcuwshg .gt_title {
 color: #333333;
 font-size: 125%;
 font-weight: initial;
@@ -2357,7 +2357,7 @@ padding-right: 5px;
 border-bottom-color: #FFFFFF;
 border-bottom-width: 0;
 }
-#cqgrkectjv .gt_subtitle {
+#ptxpcuwshg .gt_subtitle {
 color: #333333;
 font-size: 85%;
 font-weight: initial;
@@ -2368,7 +2368,7 @@ padding-right: 5px;
 border-top-color: #FFFFFF;
 border-top-width: 0;
 }
-#cqgrkectjv .gt_heading {
+#ptxpcuwshg .gt_heading {
 background-color: #FFFFFF;
 text-align: center;
 border-bottom-color: #FFFFFF;
@@ -2379,12 +2379,12 @@ border-right-style: none;
 border-right-width: 1px;
 border-right-color: #D3D3D3;
 }
-#cqgrkectjv .gt_bottom_border {
+#ptxpcuwshg .gt_bottom_border {
 border-bottom-style: solid;
 border-bottom-width: 2px;
 border-bottom-color: #D3D3D3;
 }
-#cqgrkectjv .gt_col_headings {
+#ptxpcuwshg .gt_col_headings {
 border-top-style: solid;
 border-top-width: 2px;
 border-top-color: #D3D3D3;
@@ -2398,7 +2398,7 @@ border-right-style: none;
 border-right-width: 1px;
 border-right-color: #D3D3D3;
 }
-#cqgrkectjv .gt_col_heading {
+#ptxpcuwshg .gt_col_heading {
 color: #333333;
 background-color: #FFFFFF;
 font-size: 100%;
@@ -2417,7 +2417,7 @@ padding-left: 5px;
 padding-right: 5px;
 overflow-x: hidden;
 }
-#cqgrkectjv .gt_column_spanner_outer {
+#ptxpcuwshg .gt_column_spanner_outer {
 color: #333333;
 background-color: #FFFFFF;
 font-size: 100%;
@@ -2428,13 +2428,13 @@ padding-bottom: 0;
 padding-left: 4px;
 padding-right: 4px;
 }
-#cqgrkectjv .gt_column_spanner_outer:first-child {
+#ptxpcuwshg .gt_column_spanner_outer:first-child {
 padding-left: 0;
 }
-#cqgrkectjv .gt_column_spanner_outer:last-child {
+#ptxpcuwshg .gt_column_spanner_outer:last-child {
 padding-right: 0;
 }
-#cqgrkectjv .gt_column_spanner {
+#ptxpcuwshg .gt_column_spanner {
 border-bottom-style: solid;
 border-bottom-width: 2px;
 border-bottom-color: #D3D3D3;
@@ -2445,10 +2445,10 @@ overflow-x: hidden;
 display: inline-block;
 width: 100%;
 }
-#cqgrkectjv .gt_spanner_row {
+#ptxpcuwshg .gt_spanner_row {
 border-bottom-style: hidden;
 }
-#cqgrkectjv .gt_group_heading {
+#ptxpcuwshg .gt_group_heading {
 padding-top: 8px;
 padding-bottom: 8px;
 padding-left: 5px;
@@ -2473,7 +2473,7 @@ border-right-color: #D3D3D3;
 vertical-align: middle;
 text-align: left;
 }
-#cqgrkectjv .gt_empty_group_heading {
+#ptxpcuwshg .gt_empty_group_heading {
 padding: 0.5px;
 color: #333333;
 background-color: #FFFFFF;
@@ -2487,13 +2487,13 @@ border-bottom-width: 2px;
 border-bottom-color: #D3D3D3;
 vertical-align: middle;
 }
-#cqgrkectjv .gt_from_md > :first-child {
+#ptxpcuwshg .gt_from_md > :first-child {
 margin-top: 0;
 }
-#cqgrkectjv .gt_from_md > :last-child {
+#ptxpcuwshg .gt_from_md > :last-child {
 margin-bottom: 0;
 }
-#cqgrkectjv .gt_row {
+#ptxpcuwshg .gt_row {
 padding-top: 8px;
 padding-bottom: 8px;
 padding-left: 5px;
@@ -2511,7 +2511,7 @@ border-right-color: #D3D3D3;
 vertical-align: middle;
 overflow-x: hidden;
 }
-#cqgrkectjv .gt_stub {
+#ptxpcuwshg .gt_stub {
 color: #333333;
 background-color: #FFFFFF;
 font-size: 100%;
@@ -2523,7 +2523,7 @@ border-right-color: #D3D3D3;
 padding-left: 5px;
 padding-right: 5px;
 }
-#cqgrkectjv .gt_stub_row_group {
+#ptxpcuwshg .gt_stub_row_group {
 color: #333333;
 background-color: #FFFFFF;
 font-size: 100%;
@@ -2536,13 +2536,13 @@ padding-left: 5px;
 padding-right: 5px;
 vertical-align: top;
 }
-#cqgrkectjv .gt_row_group_first td {
+#ptxpcuwshg .gt_row_group_first td {
 border-top-width: 2px;
 }
-#cqgrkectjv .gt_row_group_first th {
+#ptxpcuwshg .gt_row_group_first th {
 border-top-width: 2px;
 }
-#cqgrkectjv .gt_summary_row {
+#ptxpcuwshg .gt_summary_row {
 color: #333333;
 background-color: #FFFFFF;
 text-transform: inherit;
@@ -2551,14 +2551,14 @@ padding-bottom: 8px;
 padding-left: 5px;
 padding-right: 5px;
 }
-#cqgrkectjv .gt_first_summary_row {
+#ptxpcuwshg .gt_first_summary_row {
 border-top-style: solid;
 border-top-color: #D3D3D3;
 }
-#cqgrkectjv .gt_first_summary_row.thick {
+#ptxpcuwshg .gt_first_summary_row.thick {
 border-top-width: 2px;
 }
-#cqgrkectjv .gt_last_summary_row {
+#ptxpcuwshg .gt_last_summary_row {
 padding-top: 8px;
 padding-bottom: 8px;
 padding-left: 5px;
@@ -2567,7 +2567,7 @@ border-bottom-style: solid;
 border-bottom-width: 2px;
 border-bottom-color: #D3D3D3;
 }
-#cqgrkectjv .gt_grand_summary_row {
+#ptxpcuwshg .gt_grand_summary_row {
 color: #333333;
 background-color: #FFFFFF;
 text-transform: inherit;
@@ -2576,7 +2576,7 @@ padding-bottom: 8px;
 padding-left: 5px;
 padding-right: 5px;
 }
-#cqgrkectjv .gt_first_grand_summary_row {
+#ptxpcuwshg .gt_first_grand_summary_row {
 padding-top: 8px;
 padding-bottom: 8px;
 padding-left: 5px;
@@ -2585,7 +2585,7 @@ border-top-style: double;
 border-top-width: 6px;
 border-top-color: #D3D3D3;
 }
-#cqgrkectjv .gt_last_grand_summary_row_top {
+#ptxpcuwshg .gt_last_grand_summary_row_top {
 padding-top: 8px;
 padding-bottom: 8px;
 padding-left: 5px;
@@ -2594,10 +2594,10 @@ border-bottom-style: double;
 border-bottom-width: 6px;
 border-bottom-color: #D3D3D3;
 }
-#cqgrkectjv .gt_striped {
+#ptxpcuwshg .gt_striped {
 background-color: rgba(128, 128, 128, 0.05);
 }
-#cqgrkectjv .gt_table_body {
+#ptxpcuwshg .gt_table_body {
 border-top-style: solid;
 border-top-width: 2px;
 border-top-color: #D3D3D3;
@@ -2605,7 +2605,7 @@ border-bottom-style: solid;
 border-bottom-width: 2px;
 border-bottom-color: #D3D3D3;
 }
-#cqgrkectjv .gt_footnotes {
+#ptxpcuwshg .gt_footnotes {
 color: #333333;
 background-color: #FFFFFF;
 border-bottom-style: none;
@@ -2618,7 +2618,7 @@ border-right-style: none;
 border-right-width: 2px;
 border-right-color: #D3D3D3;
 }
-#cqgrkectjv .gt_footnote {
+#ptxpcuwshg .gt_footnote {
 margin: 0px;
 font-size: 90%;
 padding-top: 4px;
@@ -2626,7 +2626,7 @@ padding-bottom: 4px;
 padding-left: 5px;
 padding-right: 5px;
 }
-#cqgrkectjv .gt_sourcenotes {
+#ptxpcuwshg .gt_sourcenotes {
 color: #333333;
 background-color: #FFFFFF;
 border-bottom-style: none;
@@ -2639,64 +2639,64 @@ border-right-style: none;
 border-right-width: 2px;
 border-right-color: #D3D3D3;
 }
-#cqgrkectjv .gt_sourcenote {
+#ptxpcuwshg .gt_sourcenote {
 font-size: 90%;
 padding-top: 4px;
 padding-bottom: 4px;
 padding-left: 5px;
 padding-right: 5px;
 }
-#cqgrkectjv .gt_left {
+#ptxpcuwshg .gt_left {
 text-align: left;
 }
-#cqgrkectjv .gt_center {
+#ptxpcuwshg .gt_center {
 text-align: center;
 }
-#cqgrkectjv .gt_right {
+#ptxpcuwshg .gt_right {
 text-align: right;
 font-variant-numeric: tabular-nums;
 }
-#cqgrkectjv .gt_font_normal {
+#ptxpcuwshg .gt_font_normal {
 font-weight: normal;
 }
-#cqgrkectjv .gt_font_bold {
+#ptxpcuwshg .gt_font_bold {
 font-weight: bold;
 }
-#cqgrkectjv .gt_font_italic {
+#ptxpcuwshg .gt_font_italic {
 font-style: italic;
 }
-#cqgrkectjv .gt_super {
+#ptxpcuwshg .gt_super {
 font-size: 65%;
 }
-#cqgrkectjv .gt_footnote_marks {
+#ptxpcuwshg .gt_footnote_marks {
 font-size: 75%;
 vertical-align: 0.4em;
 position: initial;
 }
-#cqgrkectjv .gt_asterisk {
+#ptxpcuwshg .gt_asterisk {
 font-size: 100%;
 vertical-align: 0;
 }
-#cqgrkectjv .gt_indent_1 {
+#ptxpcuwshg .gt_indent_1 {
 text-indent: 5px;
 }
-#cqgrkectjv .gt_indent_2 {
+#ptxpcuwshg .gt_indent_2 {
 text-indent: 10px;
 }
-#cqgrkectjv .gt_indent_3 {
+#ptxpcuwshg .gt_indent_3 {
 text-indent: 15px;
 }
-#cqgrkectjv .gt_indent_4 {
+#ptxpcuwshg .gt_indent_4 {
 text-indent: 20px;
 }
-#cqgrkectjv .gt_indent_5 {
+#ptxpcuwshg .gt_indent_5 {
 text-indent: 25px;
 }
-#cqgrkectjv .katex-display {
+#ptxpcuwshg .katex-display {
 display: inline-flex !important;
 margin-bottom: 0.75em !important;
 }
-#cqgrkectjv div.Reactable > div.rt-table > div.rt-thead > div.rt-tr.rt-tr-group-header > div.rt-th-group:after {
+#ptxpcuwshg div.Reactable > div.rt-table > div.rt-thead > div.rt-tr.rt-tr-group-header > div.rt-th-group:after {
 height: 0px !important;
 }
 </style>
@@ -2767,20 +2767,20 @@ height: 0px !important;
 <span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a><span class="fu">gt</span>(<span class="fu">tibble</span>(<span class="at">feature_set =</span> <span class="fu">names</span>(feature_sets), <span class="at">predictors =</span> <span class="fu">lengths</span>(feature_sets)))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <div class="cell-output-display">
-<div id="paoiyoaelj" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#paoiyoaelj table {
+<div id="oqqffuaaih" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#oqqffuaaih table {
 font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
 -webkit-font-smoothing: antialiased;
 -moz-osx-font-smoothing: grayscale;
 }
-#paoiyoaelj thead, #paoiyoaelj tbody, #paoiyoaelj tfoot, #paoiyoaelj tr, #paoiyoaelj td, #paoiyoaelj th {
+#oqqffuaaih thead, #oqqffuaaih tbody, #oqqffuaaih tfoot, #oqqffuaaih tr, #oqqffuaaih td, #oqqffuaaih th {
 border-style: none;
 }
-#paoiyoaelj p {
+#oqqffuaaih p {
 margin: 0;
 padding: 0;
 }
-#paoiyoaelj .gt_table {
+#oqqffuaaih .gt_table {
 display: table;
 border-collapse: collapse;
 line-height: normal;
@@ -2805,11 +2805,11 @@ border-left-style: none;
 border-left-width: 2px;
 border-left-color: #D3D3D3;
 }
-#paoiyoaelj .gt_caption {
+#oqqffuaaih .gt_caption {
 padding-top: 4px;
 padding-bottom: 4px;
 }
-#paoiyoaelj .gt_title {
+#oqqffuaaih .gt_title {
 color: #333333;
 font-size: 125%;
 font-weight: initial;
@@ -2820,7 +2820,7 @@ padding-right: 5px;
 border-bottom-color: #FFFFFF;
 border-bottom-width: 0;
 }
-#paoiyoaelj .gt_subtitle {
+#oqqffuaaih .gt_subtitle {
 color: #333333;
 font-size: 85%;
 font-weight: initial;
@@ -2831,7 +2831,7 @@ padding-right: 5px;
 border-top-color: #FFFFFF;
 border-top-width: 0;
 }
-#paoiyoaelj .gt_heading {
+#oqqffuaaih .gt_heading {
 background-color: #FFFFFF;
 text-align: center;
 border-bottom-color: #FFFFFF;
@@ -2842,12 +2842,12 @@ border-right-style: none;
 border-right-width: 1px;
 border-right-color: #D3D3D3;
 }
-#paoiyoaelj .gt_bottom_border {
+#oqqffuaaih .gt_bottom_border {
 border-bottom-style: solid;
 border-bottom-width: 2px;
 border-bottom-color: #D3D3D3;
 }
-#paoiyoaelj .gt_col_headings {
+#oqqffuaaih .gt_col_headings {
 border-top-style: solid;
 border-top-width: 2px;
 border-top-color: #D3D3D3;
@@ -2861,7 +2861,7 @@ border-right-style: none;
 border-right-width: 1px;
 border-right-color: #D3D3D3;
 }
-#paoiyoaelj .gt_col_heading {
+#oqqffuaaih .gt_col_heading {
 color: #333333;
 background-color: #FFFFFF;
 font-size: 100%;
@@ -2880,7 +2880,7 @@ padding-left: 5px;
 padding-right: 5px;
 overflow-x: hidden;
 }
-#paoiyoaelj .gt_column_spanner_outer {
+#oqqffuaaih .gt_column_spanner_outer {
 color: #333333;
 background-color: #FFFFFF;
 font-size: 100%;
@@ -2891,13 +2891,13 @@ padding-bottom: 0;
 padding-left: 4px;
 padding-right: 4px;
 }
-#paoiyoaelj .gt_column_spanner_outer:first-child {
+#oqqffuaaih .gt_column_spanner_outer:first-child {
 padding-left: 0;
 }
-#paoiyoaelj .gt_column_spanner_outer:last-child {
+#oqqffuaaih .gt_column_spanner_outer:last-child {
 padding-right: 0;
 }
-#paoiyoaelj .gt_column_spanner {
+#oqqffuaaih .gt_column_spanner {
 border-bottom-style: solid;
 border-bottom-width: 2px;
 border-bottom-color: #D3D3D3;
@@ -2908,10 +2908,10 @@ overflow-x: hidden;
 display: inline-block;
 width: 100%;
 }
-#paoiyoaelj .gt_spanner_row {
+#oqqffuaaih .gt_spanner_row {
 border-bottom-style: hidden;
 }
-#paoiyoaelj .gt_group_heading {
+#oqqffuaaih .gt_group_heading {
 padding-top: 8px;
 padding-bottom: 8px;
 padding-left: 5px;
@@ -2936,7 +2936,7 @@ border-right-color: #D3D3D3;
 vertical-align: middle;
 text-align: left;
 }
-#paoiyoaelj .gt_empty_group_heading {
+#oqqffuaaih .gt_empty_group_heading {
 padding: 0.5px;
 color: #333333;
 background-color: #FFFFFF;
@@ -2950,13 +2950,13 @@ border-bottom-width: 2px;
 border-bottom-color: #D3D3D3;
 vertical-align: middle;
 }
-#paoiyoaelj .gt_from_md > :first-child {
+#oqqffuaaih .gt_from_md > :first-child {
 margin-top: 0;
 }
-#paoiyoaelj .gt_from_md > :last-child {
+#oqqffuaaih .gt_from_md > :last-child {
 margin-bottom: 0;
 }
-#paoiyoaelj .gt_row {
+#oqqffuaaih .gt_row {
 padding-top: 8px;
 padding-bottom: 8px;
 padding-left: 5px;
@@ -2974,7 +2974,7 @@ border-right-color: #D3D3D3;
 vertical-align: middle;
 overflow-x: hidden;
 }
-#paoiyoaelj .gt_stub {
+#oqqffuaaih .gt_stub {
 color: #333333;
 background-color: #FFFFFF;
 font-size: 100%;
@@ -2986,7 +2986,7 @@ border-right-color: #D3D3D3;
 padding-left: 5px;
 padding-right: 5px;
 }
-#paoiyoaelj .gt_stub_row_group {
+#oqqffuaaih .gt_stub_row_group {
 color: #333333;
 background-color: #FFFFFF;
 font-size: 100%;
@@ -2999,13 +2999,13 @@ padding-left: 5px;
 padding-right: 5px;
 vertical-align: top;
 }
-#paoiyoaelj .gt_row_group_first td {
+#oqqffuaaih .gt_row_group_first td {
 border-top-width: 2px;
 }
-#paoiyoaelj .gt_row_group_first th {
+#oqqffuaaih .gt_row_group_first th {
 border-top-width: 2px;
 }
-#paoiyoaelj .gt_summary_row {
+#oqqffuaaih .gt_summary_row {
 color: #333333;
 background-color: #FFFFFF;
 text-transform: inherit;
@@ -3014,14 +3014,14 @@ padding-bottom: 8px;
 padding-left: 5px;
 padding-right: 5px;
 }
-#paoiyoaelj .gt_first_summary_row {
+#oqqffuaaih .gt_first_summary_row {
 border-top-style: solid;
 border-top-color: #D3D3D3;
 }
-#paoiyoaelj .gt_first_summary_row.thick {
+#oqqffuaaih .gt_first_summary_row.thick {
 border-top-width: 2px;
 }
-#paoiyoaelj .gt_last_summary_row {
+#oqqffuaaih .gt_last_summary_row {
 padding-top: 8px;
 padding-bottom: 8px;
 padding-left: 5px;
@@ -3030,7 +3030,7 @@ border-bottom-style: solid;
 border-bottom-width: 2px;
 border-bottom-color: #D3D3D3;
 }
-#paoiyoaelj .gt_grand_summary_row {
+#oqqffuaaih .gt_grand_summary_row {
 color: #333333;
 background-color: #FFFFFF;
 text-transform: inherit;
@@ -3039,7 +3039,7 @@ padding-bottom: 8px;
 padding-left: 5px;
 padding-right: 5px;
 }
-#paoiyoaelj .gt_first_grand_summary_row {
+#oqqffuaaih .gt_first_grand_summary_row {
 padding-top: 8px;
 padding-bottom: 8px;
 padding-left: 5px;
@@ -3048,7 +3048,7 @@ border-top-style: double;
 border-top-width: 6px;
 border-top-color: #D3D3D3;
 }
-#paoiyoaelj .gt_last_grand_summary_row_top {
+#oqqffuaaih .gt_last_grand_summary_row_top {
 padding-top: 8px;
 padding-bottom: 8px;
 padding-left: 5px;
@@ -3057,10 +3057,10 @@ border-bottom-style: double;
 border-bottom-width: 6px;
 border-bottom-color: #D3D3D3;
 }
-#paoiyoaelj .gt_striped {
+#oqqffuaaih .gt_striped {
 background-color: rgba(128, 128, 128, 0.05);
 }
-#paoiyoaelj .gt_table_body {
+#oqqffuaaih .gt_table_body {
 border-top-style: solid;
 border-top-width: 2px;
 border-top-color: #D3D3D3;
@@ -3068,7 +3068,7 @@ border-bottom-style: solid;
 border-bottom-width: 2px;
 border-bottom-color: #D3D3D3;
 }
-#paoiyoaelj .gt_footnotes {
+#oqqffuaaih .gt_footnotes {
 color: #333333;
 background-color: #FFFFFF;
 border-bottom-style: none;
@@ -3081,7 +3081,7 @@ border-right-style: none;
 border-right-width: 2px;
 border-right-color: #D3D3D3;
 }
-#paoiyoaelj .gt_footnote {
+#oqqffuaaih .gt_footnote {
 margin: 0px;
 font-size: 90%;
 padding-top: 4px;
@@ -3089,7 +3089,7 @@ padding-bottom: 4px;
 padding-left: 5px;
 padding-right: 5px;
 }
-#paoiyoaelj .gt_sourcenotes {
+#oqqffuaaih .gt_sourcenotes {
 color: #333333;
 background-color: #FFFFFF;
 border-bottom-style: none;
@@ -3102,64 +3102,64 @@ border-right-style: none;
 border-right-width: 2px;
 border-right-color: #D3D3D3;
 }
-#paoiyoaelj .gt_sourcenote {
+#oqqffuaaih .gt_sourcenote {
 font-size: 90%;
 padding-top: 4px;
 padding-bottom: 4px;
 padding-left: 5px;
 padding-right: 5px;
 }
-#paoiyoaelj .gt_left {
+#oqqffuaaih .gt_left {
 text-align: left;
 }
-#paoiyoaelj .gt_center {
+#oqqffuaaih .gt_center {
 text-align: center;
 }
-#paoiyoaelj .gt_right {
+#oqqffuaaih .gt_right {
 text-align: right;
 font-variant-numeric: tabular-nums;
 }
-#paoiyoaelj .gt_font_normal {
+#oqqffuaaih .gt_font_normal {
 font-weight: normal;
 }
-#paoiyoaelj .gt_font_bold {
+#oqqffuaaih .gt_font_bold {
 font-weight: bold;
 }
-#paoiyoaelj .gt_font_italic {
+#oqqffuaaih .gt_font_italic {
 font-style: italic;
 }
-#paoiyoaelj .gt_super {
+#oqqffuaaih .gt_super {
 font-size: 65%;
 }
-#paoiyoaelj .gt_footnote_marks {
+#oqqffuaaih .gt_footnote_marks {
 font-size: 75%;
 vertical-align: 0.4em;
 position: initial;
 }
-#paoiyoaelj .gt_asterisk {
+#oqqffuaaih .gt_asterisk {
 font-size: 100%;
 vertical-align: 0;
 }
-#paoiyoaelj .gt_indent_1 {
+#oqqffuaaih .gt_indent_1 {
 text-indent: 5px;
 }
-#paoiyoaelj .gt_indent_2 {
+#oqqffuaaih .gt_indent_2 {
 text-indent: 10px;
 }
-#paoiyoaelj .gt_indent_3 {
+#oqqffuaaih .gt_indent_3 {
 text-indent: 15px;
 }
-#paoiyoaelj .gt_indent_4 {
+#oqqffuaaih .gt_indent_4 {
 text-indent: 20px;
 }
-#paoiyoaelj .gt_indent_5 {
+#oqqffuaaih .gt_indent_5 {
 text-indent: 25px;
 }
-#paoiyoaelj .katex-display {
+#oqqffuaaih .katex-display {
 display: inline-flex !important;
 margin-bottom: 0.75em !important;
 }
-#paoiyoaelj div.Reactable > div.rt-table > div.rt-thead > div.rt-tr.rt-tr-group-header > div.rt-th-group:after {
+#oqqffuaaih div.Reactable > div.rt-table > div.rt-thead > div.rt-tr.rt-tr-group-header > div.rt-th-group:after {
 height: 0px !important;
 }
 </style>
@@ -3424,7 +3424,7 @@ height: 0px !important;
 </section>
 <section id="model-evaluation-and-comparison" class="level2">
 <h2 class="anchored" data-anchor-id="model-evaluation-and-comparison">Model Evaluation and Comparison</h2>
-<p>Each model’s predictions are evaluated against observed next-year major-donor conversions using average precision, ROC AUC, and Brier score. <strong>Average precision</strong> is the primary selection metric because it measures how effectively a model ranks rare positive cases. ROC AUC measures discrimination between positive and negative cases, while the Brier score measures squared probability error (lower is better). The number and percentage of eventual major donors captured within the top 5%, 10%, and 20% of ranked constituents are also calculated to assess potential usefulness for donor prioritization.</p>
+<p>Each model’s predictions are evaluated against observed next-year major-donor conversions using average precision, ROC AUC, and Brier score. <strong>Average precision</strong> is the primary selection metric because it measures how effectively a model ranks rare positive cases. ROC AUC measures discrimination between positive and negative cases, while the Brier score measures squared probability error (lower is better).</p>
 <div class="cell">
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb8"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>score_model <span class="ot">&lt;-</span> <span class="cf">function</span>(data) {</span>
 <span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a></span>
@@ -3515,18 +3515,18 @@ height: 0px !important;
 <span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>model_summary <span class="ot">&lt;-</span> comparison <span class="sc">%&gt;%</span></span>
 <span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">group_by</span>(model, feature_set) <span class="sc">%&gt;%</span></span>
 <span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">summarise</span>(</span>
-<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">mean_precision =</span> <span class="fu">mean</span>(average_precision, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">mean_ap =</span> <span class="fu">mean</span>(average_precision, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
 <span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">mean_roc_auc =</span> <span class="fu">mean</span>(roc_auc, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
 <span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">mean_brier =</span> <span class="fu">mean</span>(brier, <span class="at">na.rm =</span> <span class="cn">TRUE</span>),</span>
 <span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">.groups =</span> <span class="st">&quot;drop&quot;</span></span>
 <span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
-<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>  <span class="fu">arrange</span>(<span class="fu">desc</span>(mean_precision))</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>  <span class="fu">arrange</span>(<span class="fu">desc</span>(mean_ap))</span>
 <span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Display model comparison</span></span>
 <span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>model_summary <span class="sc">%&gt;%</span></span>
 <span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>  <span class="fu">gt</span>() <span class="sc">%&gt;%</span></span>
 <span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>  <span class="fu">fmt_number</span>(</span>
-<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">columns =</span> <span class="fu">c</span>(mean_precision, mean_roc_auc),</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">columns =</span> <span class="fu">c</span>(mean_ap, mean_roc_auc),</span>
 <span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>    <span class="at">decimals =</span> <span class="dv">3</span></span>
 <span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
 <span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>  <span class="fu">fmt_number</span>(</span>
@@ -3936,7 +3936,7 @@ height: 0px !important;
 <tr class="gt_col_headings header">
 <th id="model" class="gt_col_heading gt_columns_bottom_border gt_left" data-quarto-table-cell-role="th" scope="col">model</th>
 <th id="feature_set" class="gt_col_heading gt_columns_bottom_border gt_left" data-quarto-table-cell-role="th" scope="col">feature_set</th>
-<th id="mean_precision" class="gt_col_heading gt_columns_bottom_border gt_right" data-quarto-table-cell-role="th" scope="col">mean_precision</th>
+<th id="mean_ap" class="gt_col_heading gt_columns_bottom_border gt_right" data-quarto-table-cell-role="th" scope="col">mean_ap</th>
 <th id="mean_roc_auc" class="gt_col_heading gt_columns_bottom_border gt_right" data-quarto-table-cell-role="th" scope="col">mean_roc_auc</th>
 <th id="mean_brier" class="gt_col_heading gt_columns_bottom_border gt_right" data-quarto-table-cell-role="th" scope="col">mean_brier</th>
 </tr>
@@ -3945,56 +3945,56 @@ height: 0px !important;
 <tr class="odd">
 <td class="gt_row gt_left" headers="model">XGBoost</td>
 <td class="gt_row gt_left" headers="feature_set">with_solicitation</td>
-<td class="gt_row gt_right" headers="mean_precision">0.192</td>
+<td class="gt_row gt_right" headers="mean_ap">0.192</td>
 <td class="gt_row gt_right" headers="mean_roc_auc">0.941</td>
 <td class="gt_row gt_right" headers="mean_brier">0.000233</td>
 </tr>
 <tr class="even">
 <td class="gt_row gt_left" headers="model">Random Forest</td>
 <td class="gt_row gt_left" headers="feature_set">with_solicitation</td>
-<td class="gt_row gt_right" headers="mean_precision">0.185</td>
+<td class="gt_row gt_right" headers="mean_ap">0.185</td>
 <td class="gt_row gt_right" headers="mean_roc_auc">0.927</td>
 <td class="gt_row gt_right" headers="mean_brier">0.000234</td>
 </tr>
 <tr class="odd">
 <td class="gt_row gt_left" headers="model">XGBoost</td>
 <td class="gt_row gt_left" headers="feature_set">without_solicitation</td>
-<td class="gt_row gt_right" headers="mean_precision">0.184</td>
+<td class="gt_row gt_right" headers="mean_ap">0.184</td>
 <td class="gt_row gt_right" headers="mean_roc_auc">0.928</td>
 <td class="gt_row gt_right" headers="mean_brier">0.000234</td>
 </tr>
 <tr class="even">
 <td class="gt_row gt_left" headers="model">Elastic Net</td>
 <td class="gt_row gt_left" headers="feature_set">with_solicitation</td>
-<td class="gt_row gt_right" headers="mean_precision">0.177</td>
+<td class="gt_row gt_right" headers="mean_ap">0.177</td>
 <td class="gt_row gt_right" headers="mean_roc_auc">0.927</td>
 <td class="gt_row gt_right" headers="mean_brier">0.000252</td>
 </tr>
 <tr class="odd">
 <td class="gt_row gt_left" headers="model">Elastic Net</td>
 <td class="gt_row gt_left" headers="feature_set">without_solicitation</td>
-<td class="gt_row gt_right" headers="mean_precision">0.176</td>
+<td class="gt_row gt_right" headers="mean_ap">0.176</td>
 <td class="gt_row gt_right" headers="mean_roc_auc">0.927</td>
 <td class="gt_row gt_right" headers="mean_brier">0.000252</td>
 </tr>
 <tr class="even">
 <td class="gt_row gt_left" headers="model">Logistic Regression</td>
 <td class="gt_row gt_left" headers="feature_set">without_solicitation</td>
-<td class="gt_row gt_right" headers="mean_precision">0.158</td>
+<td class="gt_row gt_right" headers="mean_ap">0.158</td>
 <td class="gt_row gt_right" headers="mean_roc_auc">0.926</td>
 <td class="gt_row gt_right" headers="mean_brier">0.000288</td>
 </tr>
 <tr class="odd">
 <td class="gt_row gt_left" headers="model">Random Forest</td>
 <td class="gt_row gt_left" headers="feature_set">without_solicitation</td>
-<td class="gt_row gt_right" headers="mean_precision">0.156</td>
+<td class="gt_row gt_right" headers="mean_ap">0.156</td>
 <td class="gt_row gt_right" headers="mean_roc_auc">0.921</td>
 <td class="gt_row gt_right" headers="mean_brier">0.000256</td>
 </tr>
 <tr class="even">
 <td class="gt_row gt_left" headers="model">Logistic Regression</td>
 <td class="gt_row gt_left" headers="feature_set">with_solicitation</td>
-<td class="gt_row gt_right" headers="mean_precision">0.148</td>
+<td class="gt_row gt_right" headers="mean_ap">0.148</td>
 <td class="gt_row gt_right" headers="mean_roc_auc">0.904</td>
 <td class="gt_row gt_right" headers="mean_brier">0.000300</td>
 </tr>
@@ -4014,7 +4014,7 @@ height: 0px !important;
 <span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">select</span>(</span>
 <span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    model,</span>
 <span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    feature_set,</span>
-<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    mean_precision,</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    mean_ap,</span>
 <span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    mean_roc_auc,</span>
 <span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    mean_brier</span>
 <span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>  ) <span class="sc">%&gt;%</span></span>
@@ -4446,14 +4446,14 @@ height: 0px !important;
 <tr class="odd">
 <td class="gt_row gt_left" headers="model">XGBoost</td>
 <td class="gt_row gt_left" headers="feature_set">with_solicitation</td>
-<td class="gt_row gt_left" headers="metric">mean_brier</td>
-<td class="gt_row gt_right" headers="value">0.0002</td>
+<td class="gt_row gt_left" headers="metric">mean_ap</td>
+<td class="gt_row gt_right" headers="value">0.1916</td>
 </tr>
 <tr class="even">
 <td class="gt_row gt_left" headers="model">XGBoost</td>
 <td class="gt_row gt_left" headers="feature_set">with_solicitation</td>
-<td class="gt_row gt_left" headers="metric">mean_precision</td>
-<td class="gt_row gt_right" headers="value">0.1916</td>
+<td class="gt_row gt_left" headers="metric">mean_brier</td>
+<td class="gt_row gt_right" headers="value">0.0002</td>
 </tr>
 <tr class="odd">
 <td class="gt_row gt_left" headers="model">XGBoost</td>
@@ -4472,8 +4472,9 @@ height: 0px !important;
 </section>
 <section id="solicitation-response-feature-importance" class="level2">
 <h2 class="anchored" data-anchor-id="solicitation-response-feature-importance">Solicitation-Response Feature Importance</h2>
-<p>Because XGBoost with solicitation-response predictors achieved the highest mean average precision during temporal validation, an additional XGBoost model is fitted using all FY2021–FY2024 development data. The model uses the same preprocessing, negative sampling strategy, and hyperparameters as the validation models.</p>
+<p>Because XGBoost with solicitation-response predictors achieved the highest mean average precision during temporal validation, it is used to examine which solicitation-related features contribute most to prediction. An additional XGBoost model is fitted using all FY2021–FY2024 development data, with the same preprocessing, negative sampling strategy, and hyperparameters as the validation models.</p>
 <p>Feature importance is measured using <strong>gain</strong>, which represents the relative improvement in XGBoost’s training objective associated with splits using each predictor. The first plot displays feature importance across all predictors, while the second focuses specifically on solicitation-related predictors. Both plots use gain values from the same fitted model, allowing their relative contributions to be compared directly.</p>
+<p>These importance measures help identify solicitation-related features for consideration in the group’s combined prediction model, but do not establish their independent predictive value or guarantee their usefulness alongside additional predictors.</p>
 <div class="cell">
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb11"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Identify positive and negative development observations</span></span>
 <span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>y_full <span class="ot">&lt;-</span> dev<span class="sc">$</span>major_donor_next_fy</span>
@@ -4547,7 +4548,7 @@ height: 0px !important;
 </div>
 </div>
 </div>
-<p>The all-features plot shows that historical giving is substantially more influential than solicitation activity. <strong>Trailing three-year giving</strong>, <strong>annual giving</strong>, and <strong>prior-year giving</strong> are the three most important predictors, with trailing three-year giving contributing the greatest gain. This suggests that historical giving behavior is the strongest source of predictive information in the fitted model.</p>
+<p>The all-features plot shows that historical giving is substantially more influential than solicitation activity. <strong>Trailing three-year giving</strong>, <strong>annual giving</strong>, and <strong>prior-year giving</strong> are the three most important predictors, with trailing three-year giving contributing the greatest gain. This makes sense given that constituents with a history of higher and more consistent giving are likely to be stronger candidates for future major-donor conversions.</p>
 <div class="cell">
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb13"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Identify solicitation-related features</span></span>
 <span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>solicitation_importance <span class="ot">&lt;-</span> importance <span class="sc">%&gt;%</span></span>
@@ -4580,11 +4581,10 @@ height: 0px !important;
 </section>
 <section id="conclusion" class="level2">
 <h2 class="anchored" data-anchor-id="conclusion">Conclusion</h2>
-<p>Across three chronological validation folds, XGBoost with solicitation-response predictors achieved the highest mean average precision (0.192), ROC AUC (0.941), and lowest mean Brier score (0.000233) among the eight model configurations. Adding solicitation features increased XGBoost’s mean average precision from 0.184 to 0.192, suggesting a modest improvement in identifying constituents likely to cross the major-donor threshold.</p>
-<p>The benefit of solicitation-response predictors varied by algorithm. Random Forest also improved with these features, while Elastic Net showed little change and Logistic Regression performed worse. This suggests that the additional predictive information may be better captured by nonlinear tree-based models.</p>
-<p>Feature importance indicates that historical giving behavior is the dominant source of predictive information. Trailing three-year giving, annual giving, and prior-year giving were the most influential predictors. Among solicitation-related features, trailing three-year solicitations contributed the most, followed by campaign response rate and digital solicitation activity.</p>
-<p>Overall, solicitation-response features appear to provide useful supplementary predictive information, although their contribution is relatively modest compared with giving history. These associations should not be interpreted as evidence that solicitation activity causes increased giving, particularly because solicitation responses are identified using payment-based proxies.</p>
-<p><strong>XGBoost with solicitation-response predictors is recommended as the leading development-stage model.</strong> However, this recommendation is based on three temporal validation folds and fixed hyperparameters rather than a comprehensive tuning procedure. The FY2025-feature/FY2026-outcome holdout remains reserved for evaluating the group’s combined model using all available feature groups.</p>
+<p>Across three chronological validation folds, adding historical solicitation-response features modestly improved predictive performance, particularly for tree-based models. XGBoost average precision increased from 0.184 to 0.192, suggesting that solicitation history provides additional predictive information beyond historical giving behavior.</p>
+<p>Feature importance identified trailing three-year solicitation count, campaign response rate, and digital solicitation activity as the most informative solicitation-related predictors. However, historical giving remained the dominant source of predictive information.</p>
+<p>These findings support carrying solicitation-response features forward for evaluation in the group’s combined major-donor prediction model. Their incremental contribution should be reassessed alongside the additional features developed by other group members, since some solicitation variables may contain overlapping information.</p>
+<p>Overall, historical solicitation activity appears to provide modest supplementary predictive value for identifying potential future major donors, although these associations do not establish that solicitation activity <em>causes</em> increased giving.</p>
 </section>
 
 </main>
