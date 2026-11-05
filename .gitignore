@@ -29,3 +29,6 @@ passport_viewing.txt
 
 # Word Documents
 *.docx
+
+# Zip Folders
+*.zip
