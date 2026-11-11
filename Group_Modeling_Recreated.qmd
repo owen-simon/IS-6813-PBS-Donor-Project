@@ -1,0 +1,2236 @@
+---
+title: "Group Modeling - Recreated"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(DBI)
+library(duckdb)
+library(here)
+library(scales)
+library(gt)
+library(yardstick)
+library(glmnet)
+library(rpart)
+```
+
+```{r}
+# Shared constants. Nothing is loaded or modeled in this foundation notebook.
+major_threshold <- 1200
+
+# Fiscal years run July-June: July-December belong to the following fiscal year
+# (a date from July 2024 through June 2025 is FY2025).
+fiscal_year_from_date <- function(date) {
+  as.integer(if_else(month(date) >= 7, year(date) + 1L, year(date)))
+}
+```
+
+## Build the Shared Development Dataset
+
+```{r}
+data_dir <- here("Data_Files")
+
+feature_years <- 2021:2024           # development feature years
+outcome_years <- feature_years + 1L  # FY2022-FY2025
+last_source_fy <- 2025L              # later source rows are never aggregated
+first_modern_fy <- 2021L             # unite payments and soft credits begin in FY2021
+
+# On-disk database in the session's temporary folder keeps memory use low.
+db_file <- file.path(tempdir(), "group_development.duckdb")
+con <- dbConnect(duckdb(), dbdir = db_file)
+```
+
+```{r}
+run_sql <- function(sql) invisible(dbExecute(con, sql))
+q <- function(sql) dbGetQuery(con, sql)
+
+# Fiscal year of a date (July-December belong to the following fiscal year).
+# TRY_CAST makes the macro work whether a column was read as DATE or text.
+run_sql("CREATE OR REPLACE MACRO fy(d) AS
+  CASE WHEN month(TRY_CAST(d AS DATE)) >= 7
+       THEN year(TRY_CAST(d AS DATE)) + 1 ELSE year(TRY_CAST(d AS DATE)) END")
+
+load_csv <- function(table, file, columns = "*") {
+  run_sql(sprintf(
+    "CREATE OR REPLACE TABLE %s AS SELECT %s FROM read_csv_auto('%s', header = true, sample_size = -1, nullstr = '')",
+    table, columns, file.path(data_dir, file)
+  ))
+}
+
+# Exact duplicate removal needs every payment and soft-credit column.
+load_csv("payments_raw", "unite_payments.csv")
+load_csv("soft_raw", "soft_credits.csv")
+load_csv("constituents_raw", "constituents_w_memberships.csv")
+load_csv("campaign_codes_raw", "campaign_codes.csv", '"Marketing Code", "Communication Method"')
+load_csv("campaign_raw", "campaign_members.csv",
+         "constituent_id, marketing_code, responded, responded_date, campaign_start_date")
+load_csv("passport_raw", "passport_viewing.txt")
+load_csv("legacy_raw", "team_approach_legacy_payments.csv",
+         paste(c("gift_date", "payment_amount", paste0("constituent_id_", 1:7)), collapse = ", "))
+
+tibble(
+  table = c("unite_payments", "soft_credits", "constituents", "campaign_members",
+            "passport_viewing", "team_approach_legacy_payments"),
+  rows = c(
+    q("SELECT COUNT(*) FROM payments_raw")[[1]], q("SELECT COUNT(*) FROM soft_raw")[[1]],
+    q("SELECT COUNT(*) FROM constituents_raw")[[1]], q("SELECT COUNT(*) FROM campaign_raw")[[1]],
+    q("SELECT COUNT(*) FROM passport_raw")[[1]], q("SELECT COUNT(*) FROM legacy_raw")[[1]]
+  )
+) |>
+  mutate(rows = comma(rows))
+```
+
+### Individuals and Spouse Groups
+
+Constituent type is used only to remove organization records. Primary constituent type and every other constituents-table attribute are **not** predictors. Spouse links are used only to build a `split_group_id` (for donor-based splits that keep spouses together), never as a feature.
+
+```{r}
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE individuals AS
+SELECT "Constituent ID" AS constituent_id, "Spouse Constituent ID" AS spouse_constituent_id
+FROM constituents_raw
+WHERE COALESCE("Constituent ID", '') NOT IN ('', 'SYN-ORPHAN')
+  AND COALESCE("Constituent Type", '') NOT ILIKE '%Organization%'
+  AND COALESCE("Primary Constituent Type", '') NOT ILIKE '%Organization%'
+)---")
+
+individuals <- q("SELECT * FROM individuals")
+
+excluded_constituents <- q(r"---(
+SELECT "Constituent ID" AS constituent_id, "Constituent Type" AS constituent_type
+FROM constituents_raw
+WHERE "Constituent ID" NOT IN (SELECT constituent_id FROM individuals)
+)---")
+excluded_constituents
+```
+
+```{r}
+# Symmetrize spouse links so a pair shares one group id even if only one lists the other.
+spouse_pairs <- individuals |>
+  filter(!is.na(spouse_constituent_id)) |>
+  transmute(constituent_id, partner_id = spouse_constituent_id)
+
+spouse_both_ways <- bind_rows(
+  spouse_pairs,
+  select(spouse_pairs, constituent_id = partner_id, partner_id = constituent_id)
+) |>
+  distinct()
+
+individuals <- individuals |>
+  left_join(
+    spouse_both_ways |>
+      group_by(constituent_id) |>
+      summarise(n_partners = n_distinct(partner_id), partner_min_id = min(partner_id), .groups = "drop"),
+    by = "constituent_id"
+  ) |>
+  mutate(split_group_id = pmin(constituent_id, partner_min_id, na.rm = TRUE))
+
+tibble(
+  n_individuals = nrow(individuals),
+  individuals_with_spouse_id = nrow(spouse_pairs),
+  spouse_id_not_in_individuals = sum(!spouse_pairs$partner_id %in% individuals$constituent_id),
+  individuals_with_multiple_partners = sum(individuals$n_partners > 1, na.rm = TRUE),
+  distinct_split_groups = n_distinct(individuals$split_group_id)
+)
+```
+
+### Aggregate Each Source to Constituent and Fiscal Year
+
+Each source is reduced to one row per constituent and fiscal year before any join.
+
+- **Direct payments**: exact duplicate rows removed; paid rows with a positive amount; individuals only.
+- **Soft credits**: exact duplicate rows removed; positive amounts; individuals only.
+- **Solicitations**: the 15 features from Owen’s feature-engineering script, rebuilt from the original campaign and campaign-code files.
+- **Passport**: Clahan’s four features, one row per constituent and fiscal year with viewing.
+- **Legacy gifts**: used only to establish existence and the year of the most recent linked gift. No household gift amount or count is assigned to any person.
+
+```{r}
+run_sql("CREATE OR REPLACE TEMP TABLE payments_dedup AS SELECT DISTINCT * FROM payments_raw")
+run_sql("CREATE OR REPLACE TEMP TABLE soft_dedup AS SELECT DISTINCT * FROM soft_raw")
+
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE direct_fy AS
+SELECT donor_id AS constituent_id, fy(credit_date)::INTEGER AS fiscal_year,
+       ROUND(SUM(payment_amount)::DOUBLE, 2) AS direct_amount,
+       COUNT(*)::INTEGER AS direct_payment_count
+FROM payments_dedup
+WHERE pledge_gift_status = 'Paid' AND payment_amount > 0
+  AND donor_id IN (SELECT constituent_id FROM individuals)
+  AND fy(credit_date) BETWEEN 2021 AND 2025
+GROUP BY 1, 2
+)---")
+
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE soft_fy AS
+SELECT "Soft Credit Constituent ID" AS constituent_id, fy("Credit Date")::INTEGER AS fiscal_year,
+       ROUND(SUM("Credit Amount")::DOUBLE, 2) AS soft_amount,
+       COUNT(*)::INTEGER AS soft_credit_count
+FROM soft_dedup
+WHERE "Credit Amount" > 0
+  AND "Soft Credit Constituent ID" IN (SELECT constituent_id FROM individuals)
+  AND fy("Credit Date") BETWEEN 2021 AND 2025
+GROUP BY 1, 2
+)---")
+```
+
+```{r}
+# One communication method per marketing code (as in Owen's script).
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE campaign_codes_unique AS
+SELECT "Marketing Code" AS marketing_code, MIN(lower("Communication Method")) AS method
+FROM campaign_codes_raw
+GROUP BY 1
+)---")
+
+# A response counts only when the row is flagged responded, has a response date, and the
+# response falls in the same fiscal year as the campaign record. Campaign start dates are
+# fiscal-year markers, not contact dates. Channel columns follow Owen's four channels.
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE campaign_fy AS
+WITH base AS (
+  SELECT c.constituent_id,
+         fy(c.campaign_start_date)::INTEGER AS fiscal_year,
+         c.marketing_code,
+         (COALESCE(lower(CAST(c.responded AS VARCHAR)) IN ('true', '1', 'yes'), FALSE)
+          AND c.responded_date IS NOT NULL
+          AND fy(c.responded_date) = fy(c.campaign_start_date)) AS valid_response,
+         k.method,
+         (k.marketing_code IS NOT NULL) AS code_linked
+  FROM campaign_raw c
+  LEFT JOIN campaign_codes_unique k ON c.marketing_code = k.marketing_code
+  WHERE c.constituent_id IN (SELECT constituent_id FROM individuals)
+    AND fy(c.campaign_start_date) BETWEEN 2021 AND 2025
+)
+SELECT constituent_id, fiscal_year,
+       COUNT(*)::INTEGER AS solicitations,
+       SUM(valid_response::INTEGER)::INTEGER AS campaign_responses,
+       SUM(code_linked::INTEGER)::INTEGER AS campaign_codes_linked,
+       SUM((method = 'digital')::INTEGER)::INTEGER AS solicitations_digital,
+       SUM((method = 'miscellaneous')::INTEGER)::INTEGER AS solicitations_miscellaneous,
+       SUM((method = 'mail')::INTEGER)::INTEGER AS solicitations_mail,
+       SUM((method = 'email')::INTEGER)::INTEGER AS solicitations_email,
+       SUM((method = 'miscellaneous' AND valid_response)::INTEGER)::INTEGER AS responses_miscellaneous,
+       COUNT(DISTINCT marketing_code)::INTEGER AS unique_campaigns_solicited
+FROM base
+GROUP BY 1, 2
+)---")
+
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE passport_fy AS
+SELECT constituent_id, fiscal_year::INTEGER AS fiscal_year,
+       SUM(titles_viewed)::INTEGER AS total_titles_viewed,
+       COUNT(DISTINCT genre)::INTEGER AS genres_viewed,
+       SUM(titles_viewed * mean_percent_watched)::DOUBLE / SUM(titles_viewed) AS weighted_mean_percent_watched
+FROM passport_raw
+WHERE constituent_id IN (SELECT constituent_id FROM individuals)
+  AND fiscal_year BETWEEN 2021 AND 2025
+GROUP BY 1, 2
+)---")
+
+# A legacy row can list up to seven household members. Unpivoting is used only to link
+# dates to people; amounts and counts are never carried forward.
+legacy_union <- paste(
+  sprintf("SELECT gift_date, payment_amount, constituent_id_%d AS constituent_id FROM legacy_raw WHERE constituent_id_%d IS NOT NULL", 1:7, 1:7),
+  collapse = " UNION ALL "
+)
+run_sql(paste("CREATE OR REPLACE TEMP TABLE legacy_links AS", legacy_union))
+```
+
+### Source Accounting: Duplicates and Excluded Records
+
+```{r}
+id_class_sql <- function(col) {
+  sprintf(
+    "CASE WHEN %s = 'SYN-ORPHAN' THEN 'SYN-ORPHAN'
+          WHEN %s IN (SELECT constituent_id FROM individuals) THEN 'individual'
+          WHEN %s IN (SELECT \"Constituent ID\" FROM constituents_raw) THEN 'organization record'
+          ELSE 'unmatched ID' END",
+    col, col, col
+  )
+}
+
+class_counts <- function(from_sql, id_col, fy_expr) {
+  q(sprintf(
+    "SELECT %s AS id_class,
+            CASE WHEN %s <= 2025 THEN 'in window' ELSE 'after FY2025' END AS fy_window,
+            COUNT(*) AS n_rows
+     FROM %s GROUP BY 1, 2",
+    id_class_sql(id_col), fy_expr, from_sql
+  ))
+}
+
+steps_from_counts <- function(source, raw, deduped, kept_label, cc) {
+  rows_of <- function(cls, win = NA_character_) {
+    sum(cc$n_rows[cc$id_class == cls & (is.na(win) | cc$fy_window == win)])
+  }
+  tibble(
+    source = source,
+    step = c(
+      "Raw rows",
+      if (!is.na(deduped)) "After exact-duplicate removal",
+      kept_label,
+      "  excluded: SYN-ORPHAN",
+      "  excluded: organization records",
+      "  excluded: unmatched IDs",
+      "  excluded: individual rows after FY2025",
+      "Aggregated: individuals, FY2021-FY2025"
+    ),
+    rows = c(
+      raw,
+      if (!is.na(deduped)) deduped,
+      sum(cc$n_rows),
+      rows_of("SYN-ORPHAN"), rows_of("organization record"), rows_of("unmatched ID"),
+      rows_of("individual", "after FY2025"), rows_of("individual", "in window")
+    )
+  )
+}
+
+count_rows <- function(sql) q(sql)[[1]]
+
+payments_cc <- class_counts(
+  "payments_dedup WHERE pledge_gift_status = 'Paid' AND payment_amount > 0", "donor_id", "fy(credit_date)"
+)
+soft_cc <- class_counts(
+  "soft_dedup WHERE \"Credit Amount\" > 0", "\"Soft Credit Constituent ID\"", "fy(\"Credit Date\")"
+)
+campaign_cc <- class_counts("campaign_raw", "constituent_id", "fy(campaign_start_date)")
+passport_cc <- class_counts("passport_raw", "constituent_id", "fiscal_year")
+
+source_accounting <- bind_rows(
+  steps_from_counts(
+    "unite_payments", count_rows("SELECT COUNT(*) FROM payments_raw"),
+    count_rows("SELECT COUNT(*) FROM payments_dedup"), "Paid and positive amount", payments_cc
+  ),
+  steps_from_counts(
+    "soft_credits", count_rows("SELECT COUNT(*) FROM soft_raw"),
+    count_rows("SELECT COUNT(*) FROM soft_dedup"), "Positive credit amount", soft_cc
+  ),
+  steps_from_counts(
+    "campaign_members", count_rows("SELECT COUNT(*) FROM campaign_raw"),
+    NA_integer_, "Rows with a campaign start date", campaign_cc
+  ),
+  steps_from_counts(
+    "passport_viewing", count_rows("SELECT COUNT(*) FROM passport_raw"),
+    NA_integer_, "All rows", passport_cc
+  )
+)
+
+# Legacy: counted in household links (a row can link up to seven people).
+legacy_link_cc <- q(sprintf(
+  "SELECT %s AS id_class, COUNT(*) AS n_links FROM legacy_links GROUP BY 1", id_class_sql("constituent_id")
+))
+legacy_accounting <- tibble(
+  source = "team_approach_legacy_payments",
+  step = c("Raw rows", "  rows linked to no constituent", "Person links (up to 7 per row)",
+           "  links excluded: not an individual", "  links used for existence and recency only"),
+  rows = c(
+    count_rows("SELECT COUNT(*) FROM legacy_raw"),
+    count_rows(paste("SELECT COUNT(*) FROM legacy_raw WHERE",
+                     paste0("constituent_id_", 1:7, " IS NULL", collapse = " AND "))),
+    sum(legacy_link_cc$n_links),
+    sum(legacy_link_cc$n_links[legacy_link_cc$id_class != "individual"]),
+    sum(legacy_link_cc$n_links[legacy_link_cc$id_class == "individual"])
+  )
+)
+
+bind_rows(source_accounting, legacy_accounting) |>
+  mutate(rows = comma(rows))
+```
+
+### Establish Existence by Feature Year
+
+The constituents table is an extract-date file with no creation date, so existence in a past year cannot be read from it. A constituent’s first activity fiscal year is the earliest fiscal year of any recorded activity: a payment row, soft-credit row, solicitation row, Passport row, or linked legacy gift. A constituent is placed in feature year t only if that year is no later than t. Evidence is never taken from a later year, and no constituent is placed in a year before their first recorded activity. Constituents with no recorded activity in any source are never included. Limitation: a person who existed earlier but had no recorded activity yet is not counted in earlier years.
+
+```{r}
+existence_sources <- q(r"---(
+SELECT i.constituent_id,
+       p.payments_first_fy, s.soft_first_fy, c.campaign_first_fy, a.passport_first_fy,
+       l.legacy_first_fy, l.legacy_last_gift_fy
+FROM individuals i
+LEFT JOIN (SELECT donor_id AS constituent_id, MIN(fy(credit_date))::INTEGER AS payments_first_fy
+           FROM payments_raw WHERE fy(credit_date) <= 2025 GROUP BY 1) p USING (constituent_id)
+LEFT JOIN (SELECT "Soft Credit Constituent ID" AS constituent_id, MIN(fy("Credit Date"))::INTEGER AS soft_first_fy
+           FROM soft_raw WHERE fy("Credit Date") <= 2025 GROUP BY 1) s USING (constituent_id)
+LEFT JOIN (SELECT constituent_id, MIN(fy(campaign_start_date))::INTEGER AS campaign_first_fy
+           FROM campaign_raw WHERE fy(campaign_start_date) <= 2025 GROUP BY 1) c USING (constituent_id)
+LEFT JOIN (SELECT constituent_id, MIN(fiscal_year)::INTEGER AS passport_first_fy
+           FROM passport_raw WHERE fiscal_year <= 2025 GROUP BY 1) a USING (constituent_id)
+LEFT JOIN (SELECT constituent_id,
+                  MIN(fy(gift_date))::INTEGER AS legacy_first_fy,
+                  MAX(CASE WHEN payment_amount > 0 THEN fy(gift_date) END)::INTEGER AS legacy_last_gift_fy
+           FROM legacy_links WHERE gift_date IS NOT NULL GROUP BY 1) l USING (constituent_id)
+)---")
+
+existence <- existence_sources |>
+  mutate(
+    first_activity_fy = pmin(
+      payments_first_fy, soft_first_fy, campaign_first_fy, passport_first_fy, legacy_first_fy,
+      na.rm = TRUE
+    )
+  )
+
+existence |>
+  summarise(
+    individuals = n(),
+    with_payments = sum(!is.na(payments_first_fy)),
+    with_soft_credits = sum(!is.na(soft_first_fy)),
+    with_campaign = sum(!is.na(campaign_first_fy)),
+    with_passport = sum(!is.na(passport_first_fy)),
+    with_legacy = sum(!is.na(legacy_first_fy)),
+    no_activity_anywhere = sum(is.na(first_activity_fy))
+  ) |>
+  mutate(across(everything(), comma))
+```
+
+```{r}
+map_dfr(feature_years, \(fy) {
+  tibble(
+    fiscal_year = fy,
+    established_by_fy_end = sum(existence$first_activity_fy <= fy, na.rm = TRUE),
+    share_of_individuals = percent(established_by_fy_end / nrow(existence), accuracy = 0.1)
+  )
+})
+```
+
+### Assemble the Development Panel
+
+```{r}
+direct_fy <- q("SELECT * FROM direct_fy")
+soft_fy <- q("SELECT * FROM soft_fy")
+campaign_fy <- q("SELECT * FROM campaign_fy")
+passport_fy <- q("SELECT * FROM passport_fy")
+
+# Direct and soft amounts stay separate; recognized giving is their sum (not cash revenue).
+giving_year <- full_join(direct_fy, soft_fy, by = c("constituent_id", "fiscal_year")) |>
+  mutate(
+    direct_amount = coalesce(direct_amount, 0),
+    soft_amount = coalesce(soft_amount, 0),
+    direct_payment_count = coalesce(direct_payment_count, 0L),
+    soft_credit_count = coalesce(soft_credit_count, 0L),
+    recognized_amount = round(direct_amount + soft_amount, 2)
+  )
+
+legacy_recency <- existence |>
+  filter(!is.na(legacy_last_gift_fy)) |>
+  select(constituent_id, legacy_last_gift_fy)
+```
+
+```{r}
+join_log <- tibble(step = character(), rows = integer())
+log_rows <- function(df, step) {
+  # Force the upstream pipeline first so earlier steps are logged before this one.
+  n <- nrow(df)
+  join_log <<- bind_rows(join_log, tibble(step = step, rows = n))
+  df
+}
+
+tier_levels <- c("None", "Entry (<$120)", "Sustaining ($120-$599)", "Upper-mid ($600-$1,199)", "Major ($1,200+)")
+amount_tier <- function(x) {
+  factor(
+    case_when(
+      is.na(x) ~ NA_character_,
+      x <= 0 ~ tier_levels[1],
+      x < 120 ~ tier_levels[2],
+      x < 600 ~ tier_levels[3],
+      x < major_threshold ~ tier_levels[4],
+      TRUE ~ tier_levels[5]
+    ),
+    levels = tier_levels
+  )
+}
+
+# Solicitation: prior-year and trailing three-year values, zero-filled as in Owen's script.
+campaign_lag <- function(k) {
+  campaign_fy |>
+    transmute(
+      constituent_id, fiscal_year = fiscal_year + k,
+      "solicitations_lag{k}" := solicitations,
+      "responses_lag{k}" := campaign_responses
+    )
+}
+
+# Assemble the panel for the given feature years. The same function builds the development
+# panel and, later, the confirmation panel. `giving_year` may include one later outcome year;
+# that year feeds only the next-year columns, because features are built from the grid rows
+# of the requested feature years and the campaign and Passport tables stop at FY2025.
+assemble_panel <- function(years, giving_year) {
+# Shifted copies of yearly giving: prior years (t-1, t-2) and the outcome year (t+1).
+giving_lag1 <- giving_year |> transmute(constituent_id, fiscal_year = fiscal_year + 1L, recognized_lag1 = recognized_amount)
+giving_lag2 <- giving_year |> transmute(constituent_id, fiscal_year = fiscal_year + 2L, recognized_lag2 = recognized_amount)
+giving_next <- giving_year |>
+  transmute(
+    constituent_id, fiscal_year = fiscal_year - 1L,
+    next_direct_amount = direct_amount, next_soft_amount = soft_amount,
+    next_recognized_amount = recognized_amount
+  )
+
+existence |>
+  filter(!is.na(first_activity_fy)) |>
+  select(constituent_id, first_activity_fy, legacy_last_gift_fy) |>
+  cross_join(tibble(fiscal_year = years)) |>
+  filter(first_activity_fy <= fiscal_year) |>
+  log_rows("Existence grid (constituent x feature year)") |>
+  left_join(giving_year, by = c("constituent_id", "fiscal_year")) |>
+  mutate(
+    across(c(direct_amount, soft_amount, recognized_amount), \(x) coalesce(x, 0)),
+    across(c(direct_payment_count, soft_credit_count), \(x) coalesce(x, 0L))
+  ) |>
+  log_rows("+ current-year giving") |>
+  group_by(constituent_id) |>
+  arrange(fiscal_year, .by_group = TRUE) |>
+  mutate(
+    cumulative_direct_amount = cumsum(direct_amount),
+    cumulative_soft_amount = cumsum(soft_amount),
+    cumulative_recognized_amount = cumsum(recognized_amount),
+    cumulative_direct_payment_count = cumsum(direct_payment_count),
+    cumulative_soft_credit_count = cumsum(soft_credit_count),
+    active_giving_years = cumsum(recognized_amount > 0),
+    peak_annual_giving_to_date = cummax(recognized_amount),
+    # Latest modern fiscal year with positive giving, strictly before the current year.
+    prior_modern_gift_fy = na_if(lag(cummax(if_else(recognized_amount > 0, fiscal_year, 0L)), default = 0L), 0L)
+  ) |>
+  ungroup() |>
+  left_join(giving_lag1, by = c("constituent_id", "fiscal_year")) |>
+  left_join(giving_lag2, by = c("constituent_id", "fiscal_year")) |>
+  left_join(giving_next, by = c("constituent_id", "fiscal_year")) |>
+  log_rows("+ prior and next-year giving") |>
+  left_join(campaign_fy, by = c("constituent_id", "fiscal_year")) |>
+  left_join(campaign_lag(1L), by = c("constituent_id", "fiscal_year")) |>
+  left_join(campaign_lag(2L), by = c("constituent_id", "fiscal_year")) |>
+  log_rows("+ solicitation") |>
+  left_join(passport_fy, by = c("constituent_id", "fiscal_year")) |>
+  log_rows("+ Passport") |>
+  left_join(select(individuals, constituent_id, split_group_id), by = "constituent_id") |>
+  log_rows("+ spouse group id")
+}
+
+panel <- assemble_panel(feature_years, giving_year)
+```
+
+```{r}
+# The same feature definitions are used for the development and confirmation panels.
+engineer_panel <- function(panel) {
+panel |>
+  mutate(
+    # Outcome-year giving is not an observed zero if it is missing from the table;
+    # outcome years FY2022-FY2025 are complete (checked below), so no giving means 0.
+    across(starts_with("next_"), \(x) coalesce(x, 0)),
+    across(c(solicitations, campaign_responses, campaign_codes_linked, solicitations_digital,
+             solicitations_miscellaneous, solicitations_mail, solicitations_email,
+             responses_miscellaneous, unique_campaigns_solicited,
+             solicitations_lag1, responses_lag1, solicitations_lag2, responses_lag2),
+           \(x) coalesce(x, 0L)),
+
+    # Target and subgroup.
+    major_donor_next_fy = as.integer(next_recognized_amount >= major_threshold),
+    current_donor = as.integer(recognized_amount > 0),
+
+    # Provisional benchmark predictors.
+    log_current_giving = log1p(recognized_amount),
+    log_peak_annual_giving = log1p(peak_annual_giving_to_date),
+    any_soft_credit_to_date = as.integer(cumulative_soft_amount > 0),
+
+    # Giving history. Prior-modern-year values are unknown for FY2021.
+    prior_recognized_amount = if_else(fiscal_year == first_modern_fy, NA_real_, coalesce(recognized_lag1, 0)),
+    two_years_back = if_else(fiscal_year <= first_modern_fy + 1L, NA_real_, coalesce(recognized_lag2, 0)),
+    yoy_change = recognized_amount - prior_recognized_amount,
+    trailing_three_year_slope = case_when(
+      fiscal_year == first_modern_fy ~ NA_real_,
+      fiscal_year == first_modern_fy + 1L ~ recognized_amount - prior_recognized_amount,
+      TRUE ~ (recognized_amount - two_years_back) / 2
+    ),
+    prior_giving_tier = amount_tier(prior_recognized_amount),
+    highest_giving_tier_to_date = amount_tier(peak_annual_giving_to_date),
+    cumulative_gift_count = cumulative_direct_payment_count + cumulative_soft_credit_count,
+    average_gifts_per_active_year = cumulative_gift_count / pmax(active_giving_years, 1),
+    average_recognized_per_active_year = cumulative_recognized_amount / pmax(active_giving_years, 1),
+
+    # Recency from the latest prior gift: modern positive giving or a linked legacy gift.
+    prior_gift_fy = case_when(
+      is.na(prior_modern_gift_fy) ~ legacy_last_gift_fy,
+      is.na(legacy_last_gift_fy) ~ prior_modern_gift_fy,
+      TRUE ~ pmax(prior_modern_gift_fy, legacy_last_gift_fy)
+    ),
+    years_since_prior_gift = fiscal_year - prior_gift_fy,
+    no_prior_gift_known = as.integer(is.na(prior_gift_fy)),
+
+    # Owen's solicitation features (15). Rates are undefined, not zero, with no solicitations.
+    # Campaign history begins in FY2021, so prior-year (FY2020) values are unknown for FY2021.
+    # Trailing totals are sums over the FY2021-onward years that exist (one observed year in
+    # FY2021, two in FY2022, three from FY2023).
+    prior_fy_solicitations = if_else(fiscal_year == first_modern_fy, NA_integer_, solicitations_lag1),
+    prior_fy_campaign_responses = if_else(fiscal_year == first_modern_fy, NA_integer_, responses_lag1),
+    trailing_3_fy_solicitations = solicitations + solicitations_lag1 + solicitations_lag2,
+    trailing_3_fy_campaign_responses = campaign_responses + responses_lag1 + responses_lag2,
+    campaign_response_rate = if_else(solicitations > 0, campaign_responses / solicitations, NA_real_),
+    trailing_3_fy_response_rate = if_else(
+      trailing_3_fy_solicitations > 0,
+      trailing_3_fy_campaign_responses / trailing_3_fy_solicitations,
+      NA_real_
+    ),
+
+    # Passport: a missing row stays a distinct state, and viewing measures stay missing.
+    passport_recorded = as.integer(!is.na(total_titles_viewed))
+  )
+}
+
+engineered <- engineer_panel(panel)
+```
+
+```{r}
+id_columns <- c("constituent_id", "split_group_id", "fiscal_year")
+eligibility_column <- "recognized_amount"
+subgroup_column <- "current_donor"
+audit_columns <- c("first_activity_fy", "prior_modern_gift_fy", "legacy_last_gift_fy", "prior_gift_fy")
+outcome_columns <- c("next_direct_amount", "next_soft_amount", "next_recognized_amount", "major_donor_next_fy")
+
+benchmark_predictors <- c(
+  "log_current_giving", "log_peak_annual_giving", "active_giving_years", "any_soft_credit_to_date"
+)
+giving_history_candidates <- c(
+  "direct_amount", "soft_amount", "direct_payment_count", "soft_credit_count",
+  "prior_recognized_amount", "yoy_change", "trailing_three_year_slope",
+  "prior_giving_tier", "highest_giving_tier_to_date", "peak_annual_giving_to_date",
+  "cumulative_direct_amount", "cumulative_soft_amount", "cumulative_recognized_amount",
+  "cumulative_direct_payment_count", "cumulative_soft_credit_count", "cumulative_gift_count",
+  "average_gifts_per_active_year", "average_recognized_per_active_year",
+  "years_since_prior_gift", "no_prior_gift_known"
+)
+# The 15 features documented in Owen's feature-engineering script, in his order.
+solicitation_features <- c(
+  "trailing_3_fy_solicitations", "campaign_response_rate", "solicitations_digital",
+  "prior_fy_solicitations", "solicitations", "trailing_3_fy_response_rate",
+  "solicitations_miscellaneous", "trailing_3_fy_campaign_responses",
+  "unique_campaigns_solicited", "campaign_codes_linked", "responses_miscellaneous",
+  "solicitations_mail", "solicitations_email", "prior_fy_campaign_responses",
+  "campaign_responses"
+)
+passport_features <- c(
+  "passport_recorded", "total_titles_viewed", "genres_viewed", "weighted_mean_percent_watched"
+)
+predictor_columns <- c(benchmark_predictors, giving_history_candidates, solicitation_features, passport_features)
+
+# Eligible population: existence established (by construction) and current giving in [0, $1,200).
+select_eligible <- function(engineered) {
+  engineered |>
+    filter(recognized_amount >= 0, recognized_amount < major_threshold) |>
+    select(all_of(c(
+      id_columns, eligibility_column, subgroup_column, predictor_columns, audit_columns, outcome_columns
+    )))
+}
+
+dev_panel <- select_eligible(engineered)
+
+tibble(
+  existence_grid_rows = join_log$rows[1],
+  eligible_rows = nrow(dev_panel),
+  predictors = length(predictor_columns),
+  positives = sum(dev_panel$major_donor_next_fy)
+) |>
+  mutate(across(everything(), comma))
+```
+
+### Prospect Pool Composition (FY2024)
+
+```{r}
+# Prospect pool composition for FY2024
+prospect_groups <- engineered |>
+  filter(fiscal_year == 2024) |>
+  mutate(
+    giving_group = case_when(
+      recognized_amount == 0 ~ "No Current-Year Giving",
+      recognized_amount > 0 &
+        recognized_amount < major_threshold ~ "Giving Below $1,200",
+      recognized_amount >= major_threshold ~ "Existing Major Donors"
+    ),
+    giving_group = factor(
+      giving_group,
+      levels = c(
+        "No Current-Year Giving",
+        "Giving Below $1,200",
+        "Existing Major Donors"
+      )
+    )
+  ) |>
+  count(giving_group, .drop = FALSE)
+
+ggplot(prospect_groups,
+       aes(x = giving_group, y = n, fill = giving_group)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = comma(n)), vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c(
+    "No Current-Year Giving" = "#2A9D8F",
+    "Giving Below $1,200" = "#457B9D",
+    "Existing Major Donors" = "#B0B0B0"
+  )) +
+  scale_y_continuous(
+    labels = comma,
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Prospect Pool Composition (FY2024)",
+    subtitle = "First two groups are eligible for prediction",
+    x = NULL,
+    y = "Number of Constituents",
+    caption = "Eligibility requires recorded activity by FY2024"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 10),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+### Feature Inventory
+
+```{r}
+feature_inventory <- tribble(
+  ~feature, ~block, ~definition, ~timing, ~missing_rule,
+  # Provisional benchmark
+  "log_current_giving", "Benchmark (provisional)", "log1p of current-year recognized giving", "Year t", "None",
+  "log_peak_annual_giving", "Benchmark (provisional)", "log1p of the highest annual recognized giving observed FY2021 through t", "Through t", "None (FY2021 sees only the current year)",
+  "active_giving_years", "Benchmark (provisional)", "Number of years FY2021 through t with positive recognized giving", "Through t", "None",
+  "any_soft_credit_to_date", "Benchmark (provisional)", "1 if any positive soft credit in FY2021 through t", "Through t", "None",
+  # Giving history (candidates reflecting Abdullah's work)
+  "direct_amount", "Giving history", "Current-year positive direct payments", "Year t", "None",
+  "soft_amount", "Giving history", "Current-year positive soft credits", "Year t", "None",
+  "direct_payment_count", "Giving history", "Current-year number of direct payments", "Year t", "None",
+  "soft_credit_count", "Giving history", "Current-year number of soft credits", "Year t", "None",
+  "prior_recognized_amount", "Giving history", "Recognized giving in year t-1", "Year t-1", "Unknown (NA) for FY2021",
+  "yoy_change", "Giving history", "Current minus prior-year recognized giving", "Years t, t-1", "Unknown (NA) for FY2021",
+  "trailing_three_year_slope", "Giving history", "Slope of recognized giving over FY t-2 to t (two points in FY2022, three from FY2023)", "Years t-2 to t", "Unknown (NA) for FY2021",
+  "prior_giving_tier", "Giving history", "Tier of year t-1 giving: none, entry, sustaining, upper-mid, major", "Year t-1", "Unknown (NA) for FY2021",
+  "highest_giving_tier_to_date", "Giving history", "Tier of the highest annual giving through t", "Through t", "None",
+  "peak_annual_giving_to_date", "Giving history", "Highest annual recognized giving FY2021 through t", "Through t", "None",
+  "cumulative_direct_amount", "Giving history", "Cumulative positive direct payments FY2021 through t", "Through t", "None",
+  "cumulative_soft_amount", "Giving history", "Cumulative positive soft credits FY2021 through t", "Through t", "None",
+  "cumulative_recognized_amount", "Giving history", "Cumulative recognized giving FY2021 through t", "Through t", "None",
+  "cumulative_direct_payment_count", "Giving history", "Cumulative number of direct payments", "Through t", "None",
+  "cumulative_soft_credit_count", "Giving history", "Cumulative number of soft credits", "Through t", "None",
+  "cumulative_gift_count", "Giving history", "Direct payments plus soft credits, cumulative", "Through t", "None",
+  "average_gifts_per_active_year", "Giving history", "Cumulative gift count divided by active giving years (at least 1)", "Through t", "None",
+  "average_recognized_per_active_year", "Giving history", "Cumulative recognized giving divided by active giving years (at least 1)", "Through t", "None",
+  "years_since_prior_gift", "Giving history", "Year t minus the fiscal year of the latest prior gift (modern positive giving before t, or a linked legacy gift)", "Before t", "NA when no prior gift is known",
+  "no_prior_gift_known", "Giving history", "1 when no prior gift is known (modern history is unobserved before FY2021)", "Before t", "None",
+  # Solicitation (Owen's 15 documented features)
+  "solicitations", "Solicitation", "Campaign-member rows for the constituent in year t", "Year t", "0 when no rows",
+  "solicitations_digital", "Solicitation", "Solicitation rows with communication method digital", "Year t", "0 when no rows",
+  "solicitations_miscellaneous", "Solicitation", "Solicitation rows with method miscellaneous", "Year t", "0 when no rows",
+  "solicitations_mail", "Solicitation", "Solicitation rows with method mail", "Year t", "0 when no rows",
+  "solicitations_email", "Solicitation", "Solicitation rows with method email", "Year t", "0 when no rows",
+  "unique_campaigns_solicited", "Solicitation", "Distinct marketing codes in year t", "Year t", "0 when no rows",
+  "campaign_codes_linked", "Solicitation", "Solicitation rows whose marketing code matches the campaign-code file", "Year t", "0 when no rows",
+  "campaign_responses", "Solicitation", "Rows flagged responded with a response date in the same fiscal year", "Year t", "0 when no rows",
+  "campaign_response_rate", "Solicitation", "campaign_responses divided by solicitations", "Year t", "NA when no solicitations",
+  "responses_miscellaneous", "Solicitation", "Qualifying responses among miscellaneous-method rows", "Year t", "0 when no rows",
+  "prior_fy_solicitations", "Solicitation", "Solicitation rows in year t-1", "Year t-1", "Unknown (NA) for FY2021 (FY2020 campaign history unavailable); 0 when none afterward",
+  "prior_fy_campaign_responses", "Solicitation", "Qualifying responses in year t-1", "Year t-1", "Unknown (NA) for FY2021 (FY2020 campaign history unavailable); 0 when none afterward",
+  "trailing_3_fy_solicitations", "Solicitation", "Solicitation rows summed over years t, t-1, t-2 that fall in FY2021 or later", "Years t-2 to t", "Sum over available history: one observed year in FY2021, two in FY2022",
+  "trailing_3_fy_campaign_responses", "Solicitation", "Qualifying responses summed over years t, t-1, t-2 that fall in FY2021 or later", "Years t-2 to t", "Sum over available history: one observed year in FY2021, two in FY2022",
+  "trailing_3_fy_response_rate", "Solicitation", "Trailing responses divided by trailing solicitations", "Years t-2 to t", "NA when no trailing solicitations",
+  # Passport (Clahan's four features)
+  "passport_recorded", "Passport", "1 when the constituent has any Passport viewing row in year t", "Year t", "0 means no Passport record, not zero viewing",
+  "total_titles_viewed", "Passport", "Titles viewed in year t, summed across genres", "Year t", "NA when no Passport record",
+  "genres_viewed", "Passport", "Distinct genres viewed in year t", "Year t", "NA when no Passport record",
+  "weighted_mean_percent_watched", "Passport", "Mean percent watched, weighted by titles viewed", "Year t", "NA when no Passport record"
+)
+
+# Model-input transformations (revision after the original configuration B fits failed to
+# converge). They are deterministic, have no learned parameters, and are applied inside each
+# training fold's preprocessing, consistently across all configurations.
+#  - log1p: nonnegative dollar amounts, gift counts, solicitation counts, and average
+#    giving or frequency measures that are not already transformed.
+#  - signed log1p, sign(x) * log1p(abs(x)): year-over-year giving change and giving slope.
+#  - none: existing log predictors (never transformed twice), binary indicators, response
+#    rates, percent-watched, Passport viewing counts, giving tiers, active giving years,
+#    and recency variables.
+log1p_predictors <- c(
+  "direct_amount", "soft_amount", "direct_payment_count", "soft_credit_count",
+  "prior_recognized_amount", "peak_annual_giving_to_date",
+  "cumulative_direct_amount", "cumulative_soft_amount", "cumulative_recognized_amount",
+  "cumulative_direct_payment_count", "cumulative_soft_credit_count", "cumulative_gift_count",
+  "average_gifts_per_active_year", "average_recognized_per_active_year",
+  setdiff(solicitation_features, c("campaign_response_rate", "trailing_3_fy_response_rate"))
+)
+signed_log_predictors <- c("yoy_change", "trailing_three_year_slope")
+
+transform_rule <- setNames(rep("none", length(predictor_columns)), predictor_columns)
+transform_rule[log1p_predictors] <- "log1p"
+transform_rule[signed_log_predictors] <- "signed log1p"
+
+feature_inventory <- feature_inventory |>
+  mutate(model_transform = case_when(
+    feature %in% c("log_current_giving", "log_peak_annual_giving") ~ "none (already log1p)",
+    TRUE ~ unname(transform_rule[feature])
+  ))
+```
+
+```{r}
+feature_inventory |>
+  count(block, name = "features")
+```
+
+```{r}
+feature_inventory |>
+  count(model_transform, name = "features")
+```
+
+```{r}
+feature_inventory
+```
+
+## Verification Checks
+
+### Keys and Joins
+
+```{r}
+dup_keys <- function(df, keys) {
+  df |> count(across(all_of(keys))) |> filter(n > 1) |> nrow()
+}
+
+key_checks <- tibble(
+  table = c("direct_fy", "soft_fy", "giving_year", "campaign_fy", "passport_fy",
+            "existence", "individuals", "dev_panel"),
+  rows = c(nrow(direct_fy), nrow(soft_fy), nrow(giving_year), nrow(campaign_fy),
+           nrow(passport_fy), nrow(existence), nrow(individuals), nrow(dev_panel)),
+  duplicate_keys = c(
+    dup_keys(direct_fy, c("constituent_id", "fiscal_year")),
+    dup_keys(soft_fy, c("constituent_id", "fiscal_year")),
+    dup_keys(giving_year, c("constituent_id", "fiscal_year")),
+    dup_keys(campaign_fy, c("constituent_id", "fiscal_year")),
+    dup_keys(passport_fy, c("constituent_id", "fiscal_year")),
+    dup_keys(existence, "constituent_id"),
+    dup_keys(individuals, "constituent_id"),
+    dup_keys(dev_panel, c("constituent_id", "fiscal_year"))
+  )
+) |>
+  mutate(rows = comma(rows))
+
+gt(key_checks)
+```
+
+```{r}
+# Each join must leave the row count unchanged.
+gt(join_log |>
+  mutate(
+    rows_changed_vs_grid = rows != rows[1],
+    rows = comma(rows)
+  )
+)
+```
+
+### Eligible Rows, Positives, and Subgroups
+
+```{r}
+summarise_target <- function(df) {
+  df |>
+    summarise(
+      eligible_rows = n(),
+      positives = sum(major_donor_next_fy),
+      positive_rate = round(mean(major_donor_next_fy), 6),
+      .groups = "drop"
+    )
+}
+
+by_year <- dev_panel |>
+  group_by(fiscal_year, outcome_year = fiscal_year + 1L) |>
+  summarise_target()
+
+gt(by_year)
+```
+
+```{r}
+# Current donors versus zero-giving constituents.
+gt(dev_panel |>
+  group_by(fiscal_year, group = if_else(current_donor == 1, "current donor", "zero giving")) |>
+  summarise_target() |>
+  arrange(fiscal_year, group))
+```
+
+```{r}
+gt(dev_panel |>
+  group_by(group = if_else(current_donor == 1, "current donor", "zero giving")) |>
+  summarise_target() |>
+  mutate(share_of_rows = percent(eligible_rows / sum(eligible_rows), accuracy = 0.1),
+         share_of_positives = percent(positives / sum(positives), accuracy = 0.1)))
+```
+
+### Reproducing Clahan's Counts
+
+Clahan’s individual analysis reported 435,889 rows with 158 positives for FY2021 to FY2023 and 179,442 rows with 49 positives for FY2024. Differences are reported, not forced.
+
+```{r}
+clahan_reference <- tribble(
+  ~partition, ~expected_rows, ~expected_positives,
+  "FY2021-FY2023", 435889L, 158L,
+  "FY2024", 179442L, 49L
+)
+
+observed_partitions <- dev_panel |>
+  mutate(partition = if_else(fiscal_year <= 2023, "FY2021-FY2023", "FY2024")) |>
+  group_by(partition) |>
+  summarise(observed_rows = n(), observed_positives = sum(major_donor_next_fy), .groups = "drop")
+
+gt(clahan_reference |>
+  left_join(observed_partitions, by = "partition") |>
+  mutate(
+    rows_difference = observed_rows - expected_rows,
+    positives_difference = observed_positives - expected_positives,
+    reproduced = rows_difference == 0 & positives_difference == 0
+  )
+)
+```
+
+Both partitions are reproduced exactly: the development panel built here has the same rows and positives as Clahan’s analysis for FY2021 to FY2023 and for FY2024, so the existence rule, the eligibility rule, and the target agree.
+
+### Passport Coverage and Predictor Missingness
+
+```{r}
+# Passport coverage by year and subgroup.
+gt(dev_panel |>
+  group_by(fiscal_year, group = if_else(current_donor == 1, "current donor", "zero giving")) |>
+  summarise(
+    rows = n(),
+    passport_rows = sum(passport_recorded),
+    coverage = percent(mean(passport_recorded), accuracy = 0.1),
+    .groups = "drop"
+  )
+)
+```
+
+```{r}
+# Predictor missingness. Passport missingness is structural (no record), prior-year
+# giving and solicitation values are unknown for FY2021 by design, and response rates
+# are undefined when there were no solicitations.
+predictor_block <- function(p) feature_inventory$block[match(p, feature_inventory$feature)]
+
+missingness <- tibble(feature = predictor_columns) |>
+  mutate(
+    block = predictor_block(feature),
+    n_missing = map_int(feature, \(p) sum(is.na(dev_panel[[p]]))),
+    pct_missing = round(n_missing / nrow(dev_panel), 4)
+  )
+
+gt(missingness |>
+  filter(n_missing > 0))
+```
+
+```{r}
+tibble(
+  predictors_with_no_missing_values = sum(missingness$n_missing == 0),
+  predictors_with_missing_values = sum(missingness$n_missing > 0)
+)
+```
+
+```{r}
+# Missingness by year for the predictors that have any.
+gt(dev_panel |>
+  group_by(fiscal_year) |>
+  summarise(
+    across(all_of(filter(missingness, n_missing > 0)$feature), \(x) round(mean(is.na(x)), 3)),
+    .groups = "drop"
+  )
+)
+```
+
+Missing Passport measures are `NA` exactly when `passport_recorded` is 0. The check below confirms there is no row with a recorded Passport state but a missing measure, and none with a measure but no recorded state.
+
+```{r}
+gt(dev_panel |>
+  summarise(
+    recorded_but_measure_missing = sum(passport_recorded == 1 & is.na(total_titles_viewed)),
+    not_recorded_but_measure_present = sum(passport_recorded == 0 & !is.na(total_titles_viewed)),
+    not_recorded_measures_all_missing = all(is.na(total_titles_viewed[passport_recorded == 0]) &
+                                              is.na(genres_viewed[passport_recorded == 0]) &
+                                              is.na(weighted_mean_percent_watched[passport_recorded == 0])),
+    minimum_titles_when_recorded = min(total_titles_viewed, na.rm = TRUE)
+  )
+)
+```
+
+### Independent Recomputation and Outcome-Year Completeness
+
+A random sample of eligible rows is recomputed directly from the yearly giving table (not from the panel code) to confirm the cumulative and next-year columns. The monthly coverage table shows that each outcome year is fully recorded, so “no giving” in an outcome year is a true zero.
+
+```{r}
+set.seed(42)
+audit_rows <- dev_panel |>
+  slice_sample(n = 2000) |>
+  select(constituent_id, fiscal_year, log_current_giving, log_peak_annual_giving,
+         active_giving_years, any_soft_credit_to_date, prior_recognized_amount,
+         next_recognized_amount)
+
+recomputed <- audit_rows |>
+  select(constituent_id, fiscal_year) |>
+  left_join(
+    giving_year |> select(constituent_id, gy = fiscal_year, recognized_amount, soft_amount),
+    by = "constituent_id", relationship = "many-to-many"
+  ) |>
+  group_by(constituent_id, fiscal_year) |>
+  summarise(
+    r_log_current = log1p(sum(recognized_amount[!is.na(gy) & gy == fiscal_year])),
+    r_log_peak = log1p(max(c(0, recognized_amount[!is.na(gy) & gy <= fiscal_year]))),
+    r_active = sum(!is.na(gy) & gy <= fiscal_year & recognized_amount > 0),
+    r_any_soft = as.integer(any(!is.na(gy) & gy <= fiscal_year & soft_amount > 0)),
+    r_prior = if_else(first(fiscal_year) == 2021L, NA_real_,
+                      sum(recognized_amount[!is.na(gy) & gy == fiscal_year - 1L])),
+    r_next = sum(recognized_amount[!is.na(gy) & gy == fiscal_year + 1L]),
+    .groups = "drop"
+  )
+
+audit_compare <- audit_rows |> inner_join(recomputed, by = c("constituent_id", "fiscal_year"))
+
+gt(tibble(
+  sampled_rows = nrow(audit_compare),
+  log_current_matches = isTRUE(all.equal(audit_compare$log_current_giving, audit_compare$r_log_current)),
+  log_peak_matches = isTRUE(all.equal(audit_compare$log_peak_annual_giving, audit_compare$r_log_peak)),
+  active_years_match = all(audit_compare$active_giving_years == audit_compare$r_active),
+  any_soft_matches = all(audit_compare$any_soft_credit_to_date == audit_compare$r_any_soft),
+  prior_matches = isTRUE(all.equal(audit_compare$prior_recognized_amount, audit_compare$r_prior)),
+  next_matches = isTRUE(all.equal(audit_compare$next_recognized_amount, audit_compare$r_next))
+    )
+)
+```
+
+```{r}
+outcome_completeness <- q(r"---(
+SELECT fy(credit_date)::INTEGER AS fiscal_year,
+       COUNT(*) AS payment_rows,
+       COUNT(DISTINCT date_trunc('month', TRY_CAST(credit_date AS DATE))) AS months_present
+FROM payments_dedup
+WHERE fy(credit_date) BETWEEN 2021 AND 2025
+GROUP BY 1 ORDER BY 1
+)---") |>
+  mutate(is_outcome_year = fiscal_year %in% outcome_years)
+
+gt(outcome_completeness)
+```
+
+### Limited Giving History in Early Years
+
+Unite payments and soft credits begin in FY2021, so modern giving history is short in the early feature years. Legacy household links add only the year of the latest linked gift.
+
+```{r}
+gt(dev_panel |>
+  group_by(fiscal_year) |>
+  summarise(
+    modern_years_observed = first(fiscal_year) - first_modern_fy + 1L,
+    rows = n(),
+    share_no_active_giving_years = percent(mean(active_giving_years == 0), accuracy = 0.1),
+    share_with_linked_legacy_gift = percent(mean(!is.na(legacy_last_gift_fy)), accuracy = 0.1),
+    share_no_prior_gift_known = percent(mean(no_prior_gift_known == 1), accuracy = 0.1),
+    share_prior_year_unknown = percent(mean(is.na(prior_recognized_amount)), accuracy = 0.1),
+    share_prior_year_solicitation_unknown = percent(mean(is.na(prior_fy_solicitations)), accuracy = 0.1),
+    years_in_trailing_solicitation_window = min(first(fiscal_year) - first_modern_fy + 1L, 3L),
+    .groups = "drop"
+  )
+)
+```
+
+## Evaluation Metric Definitions
+
+**Average precision** is the working primary metric. For a set of scores, it is the sum over distinct score thresholds of the increase in recall times the precision at that threshold. Rows with identical scores are handled together, so tied or constant scores do not create a spurious ordering. For a constant score it equals the event prevalence, the no-skill value.
+
+**Trapezoidal PR AUC** is a different quantity: the area under the precision-recall curve using straight-line (trapezoid) interpolation. With tied or constant scores it can be a degenerate-curve artifact. It is **kept distinct** and may be reported only as a labeled diagnostic. The toy example below shows how the two differ on a constant score (no model involved).
+
+```{r}
+toy <- tibble(
+  truth = factor(c(rep("yes", 3), rep("no", 997)), levels = c("yes", "no")),
+  constant_score = 0.01,
+  informative_score = c(0.9, 0.5, 0.2, seq(0.45, 0, length.out = 997))
+)
+
+gt(map_dfr(c("constant_score", "informative_score"), \(col) {
+  tibble(
+    score = col,
+    prevalence = mean(toy$truth == "yes"),
+    average_precision = average_precision(toy, truth, all_of(col))$.estimate,
+    pr_auc_trapezoidal = pr_auc(toy, truth, all_of(col))$.estimate
+  )
+})
+)
+```
+
+## Development Evaluation Protocol
+
+This protocol is written **before any model is fit**. It governs the development comparison only. Feature year FY2025 is neither built nor scored in the development comparison, and nothing below is chosen using FY2025 results (which Clahan Tran’s individual analysis has already seen).
+
+| Fold | Training Feature Years | Validation Feature Year | Validation Outcome Year |
+|:--|:--:|:--:|:--:|
+| 1 | FY2021 | FY2022 | FY 2023 |
+| 2 | FY2021 to FY2022 | FY2023 | FY 2024 |
+| 3 | FY2021 to FY2023 | FY2024 | FY 2025 |
+
+Every validation year comes after its training years, so no training outcome is later than a validation row’s feature year.
+
+### Scoring and aggregation.
+
+- The **complete eligible validation population** of each fold is scored: no sampling, no negative subsampling, and no reweighting.
+- Each fold is reported separately, and results are also summarized as the **unweighted mean across the three folds** (each fold counts equally, so a year with more positives does not dominate).
+- A **constant-probability baseline** uses each training fold’s prevalence as the score for every validation row.
+
+### Metrics
+
+The primary metric is **average precision**: the sum, over distinct score thresholds, of the increase in recall times the precision at that threshold, with tied scores handled together. It is deliberately kept distinct from trapezoidal PR AUC, which is not used for any selection. Also reported: ROC AUC, Brier score, log loss, and tie-aware precision, recall, lift, and positives captured in the top 100 and top 500. Lift is precision in the list divided by the validation prevalence.
+
+**Tie-aware top-K**: Rows scored above the cutoff score are all included. The remaining slotNos are filled in proportion to the positive rate among rows tied at the cutoff, so the expected number of positives does not depend on arbitrary row order. For a constant score every row is tied, so the expected lift equals 1.
+
+**Model selection and its limits**: The ridge penalty (and, for the tree, its settings) is chosen from a grid declared below before fitting, using mean development average precision. Because the same three folds are used both to choose these settings and to report performance, the reported development results are optimistic and are not an independent final estimate. Small point-estimate differences between configurations are not tested for statistical significance and should not be read as established improvements. The provisional benchmark is a working choice and is not group-approved.
+
+```{r}
+# Average precision with tied scores handled together (one threshold per distinct score).
+average_precision_tied <- function(y, p) {
+  n_pos <- sum(y == 1)
+  if (n_pos == 0) return(NA_real_)
+  ord <- order(p, decreasing = TRUE)
+  y_sorted <- y[ord]
+  p_sorted <- p[ord]
+  group_end <- c(which(diff(p_sorted) != 0), length(p_sorted))
+  cum_pos <- cumsum(y_sorted)[group_end]
+  new_pos <- diff(c(0, cum_pos))
+  sum(new_pos * cum_pos / group_end) / n_pos
+}
+
+# ROC AUC from average ranks, so tied scores count as half a win (constant score = 0.5).
+roc_auc_tied <- function(y, p) {
+  n_pos <- sum(y == 1)
+  n_neg <- sum(y == 0)
+  if (n_pos == 0 || n_neg == 0) return(NA_real_)
+  ranks <- rank(p)
+  (sum(ranks[y == 1]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+}
+
+brier_score <- function(y, p) mean((p - y)^2)
+
+log_loss <- function(y, p) {
+  p <- pmin(pmax(p, 1e-15), 1 - 1e-15)
+  -mean(y * log(p) + (1 - y) * log(1 - p))
+}
+
+# Rows above the cutoff score are all included; the remaining slots are filled
+# proportionally from the rows tied at the cutoff.
+top_k_tie_aware <- function(y, p, k) {
+  cutoff <- sort(p, decreasing = TRUE)[k]
+  above <- p > cutoff
+  tied <- p == cutoff
+  slots_from_ties <- k - sum(above)
+  captured <- sum(y[above]) + slots_from_ties * mean(y[tied])
+  n_pos <- sum(y)
+  list(
+    captured = captured,
+    precision = captured / k,
+    recall = captured / n_pos,
+    lift = (captured / k) / (n_pos / length(y))
+  )
+}
+
+# One row of metrics for a set of validation scores, overall and by subgroup.
+evaluate_scores <- function(y, p, current_donor) {
+  tk100 <- top_k_tie_aware(y, p, 100)
+  tk500 <- top_k_tie_aware(y, p, 500)
+  subgroup <- function(flag) {
+    idx <- which(flag)
+    list(rows = length(idx), positives = sum(y[idx]),
+         ap = average_precision_tied(y[idx], p[idx]), roc = roc_auc_tied(y[idx], p[idx]))
+  }
+  donors <- subgroup(current_donor == 1)
+  zero <- subgroup(current_donor == 0)
+  tibble(
+    validation_rows = length(y),
+    validation_positives = sum(y),
+    average_precision = average_precision_tied(y, p),
+    roc_auc = roc_auc_tied(y, p),
+    brier = brier_score(y, p),
+    log_loss = log_loss(y, p),
+    captured_top100 = tk100$captured, precision_top100 = tk100$precision,
+    recall_top100 = tk100$recall, lift_top100 = tk100$lift,
+    captured_top500 = tk500$captured, precision_top500 = tk500$precision,
+    recall_top500 = tk500$recall, lift_top500 = tk500$lift,
+    rows_current_donor = donors$rows, positives_current_donor = donors$positives,
+    ap_current_donor = donors$ap, roc_current_donor = donors$roc,
+    rows_zero_giving = zero$rows, positives_zero_giving = zero$positives,
+    ap_zero_giving = zero$ap, roc_zero_giving = zero$roc
+  )
+}
+```
+
+Before relying on these functions, two checks: the average-precision implementation matches the `yardstick` implementation on scores with many ties, and a constant score gives an expected top-K lift of 1 whatever the row order.
+
+```{r}
+set.seed(42)
+check_y <- rbinom(5000, 1, 0.02)
+check_p <- round(runif(5000), 2)   # rounded so many scores are tied
+check_data <- tibble(
+  truth = factor(if_else(check_y == 1, "yes", "no"), levels = c("yes", "no")),
+  score = check_p
+)
+
+gt(tibble(
+  implementation = c("Own tie-aware average precision", "yardstick::average_precision"),
+  value = c(
+    average_precision_tied(check_y, check_p),
+    yardstick::average_precision(check_data, truth, score)$.estimate
+  )
+))
+```
+
+```{r}
+constant_scores <- rep(mean(check_y), length(check_y))
+shuffled <- sample(length(check_y))
+
+gt(tibble(
+  ordering = c("original row order", "shuffled row order"),
+  expected_lift_top100 = c(
+    top_k_tie_aware(check_y, constant_scores, 100)$lift,
+    top_k_tie_aware(check_y[shuffled], constant_scores[shuffled], 100)$lift
+  ),
+  expected_lift_top500 = c(
+    top_k_tie_aware(check_y, constant_scores, 500)$lift,
+    top_k_tie_aware(check_y[shuffled], constant_scores[shuffled], 500)$lift
+  )
+))
+```
+
+### Declared Grids
+
+```{r}
+# Revised grid (development stage): the two weakest penalties, 0.00001 and 0.0001, were
+# removed because fits at those penalties did not converge. All four candidate
+# configurations (A to D) use exactly this grid.
+lambda_grid <- c(0.001, 0.01, 0.1)
+
+tree_grid <- expand_grid(cp = c(0.00001, 0.0001, 0.001), minbucket = c(25L, 100L))
+tree_maxdepth <- 6L
+
+# Explicit optimization limit for the ridge fits (see "Development-stage revision").
+ridge_maxit <- 5000L
+
+list(ridge_lambda = lambda_grid, ridge_maxit = ridge_maxit, tree_settings = tree_grid)
+```
+
+```{r}
+folds <- tribble(
+  ~fold, ~description, ~validation_year,
+  1L, "Train FY2021, validate FY2022", 2022L,
+  2L, "Train FY2021-FY2022, validate FY2023", 2023L,
+  3L, "Train FY2021-FY2023, validate FY2024", 2024L
+)
+
+fold_rows <- function(fold) {
+  validation_year <- folds$validation_year[folds$fold == fold]
+  list(
+    train = filter(dev_panel, fiscal_year < validation_year),
+    valid = filter(dev_panel, fiscal_year == validation_year)
+  )
+}
+
+gt(map_dfr(folds$fold, \(f) {
+  s <- fold_rows(f)
+  tibble(
+    fold = f,
+    description = folds$description[folds$fold == f],
+    train_rows = nrow(s$train),
+    train_positives = sum(s$train$major_donor_next_fy),
+    validation_rows = nrow(s$valid),
+    validation_positives = sum(s$valid$major_donor_next_fy),
+    validation_current_donors = sum(s$valid$current_donor),
+    validation_zero_giving = sum(1 - s$valid$current_donor)
+  )
+}) |>
+  mutate(across(where(is.integer) & !fold, comma)))
+```
+
+## Feature Configurations and Estimators
+
+Six configurations were planned. Each adds one contributor’s block (or a combination of blocks) to the same four-predictor provisional benchmark, so the effect of each block can be read against configuration A. 
+
+**Only A to D are fitted as candidates**. Configuration E failed the convergence checks, and F (which contains all of E’s predictors) was not attempted, so neither has valid performance results (see the scope revision below). The definitions of E and F are kept here only so the planned design is on record.
+
+```{r}
+categorical_predictors <- c("prior_giving_tier", "highest_giving_tier_to_date")
+
+feature_configs <- list(
+  A = benchmark_predictors,
+  B = c(benchmark_predictors, giving_history_candidates),
+  C = c(benchmark_predictors, solicitation_features),
+  D = c(benchmark_predictors, passport_features),
+  E = c(benchmark_predictors, giving_history_candidates, solicitation_features),
+  F = c(benchmark_predictors, giving_history_candidates, solicitation_features, passport_features)
+)
+
+config_labels <- c(
+  A = "A. Benchmark only (provisional)",
+  B = "B. A + giving history (Abdullah Khan)",
+  C = "C. A + solicitation, 15 documented (Owen)",
+  D = "D. A + Passport (Clahan Tran)",
+  E = "E. A + giving history + solicitation",
+  F = "F. A + giving history + solicitation + Passport"
+)
+
+gt(tibble(
+  config = names(feature_configs),
+  label = unname(config_labels[names(feature_configs)]),
+  predictors = unname(lengths(feature_configs)),
+  benchmark = unname(map_int(feature_configs, \(x) sum(x %in% benchmark_predictors))),
+  giving_history = unname(map_int(feature_configs, \(x) sum(x %in% giving_history_candidates))),
+  solicitation = unname(map_int(feature_configs, \(x) sum(x %in% solicitation_features))),
+  passport = unname(map_int(feature_configs, \(x) sum(x %in% passport_features)))
+))
+```
+
+## Development-Stage Revision: Transformed Predictor
+
+```{r}
+# The transforms need nonnegative inputs where log1p is used, must not overlap the
+# existing log predictors, and must cover every predictor.
+gt(tibble(
+  log1p_predictors = length(log1p_predictors),
+  log1p_inputs_all_nonnegative = all(map_lgl(log1p_predictors, \(p) all(dev_panel[[p]] >= 0, na.rm = TRUE))),
+  signed_log_predictors = length(signed_log_predictors),
+  existing_log_predictors_untouched = !any(c("log_current_giving", "log_peak_annual_giving") %in%
+                                             c(log1p_predictors, signed_log_predictors)),
+  rules_cover_every_predictor = setequal(names(transform_rule), predictor_columns)
+))
+```
+
+## Modeling
+
+### Preprocessing Within Each Training Fold
+
+```{r}
+prepare_fold <- function(train, valid, predictors) {
+  cat_cols <- intersect(predictors, categorical_predictors)
+  num_cols <- setdiff(predictors, cat_cols)
+
+  # Step 1: predictors with no observed training value cannot be imputed from training.
+  all_missing <- predictors[map_lgl(predictors, \(p) all(is.na(train[[p]])))]
+  num_cols <- setdiff(num_cols, all_missing)
+  cat_cols <- setdiff(cat_cols, all_missing)
+
+  # Step 2: deterministic transforms (no learned parameters), then training medians
+  # computed on the transformed training values.
+  transform_numeric <- function(df) {
+    m <- as.matrix(df[num_cols])
+    storage.mode(m) <- "double"
+    for (j in seq_along(num_cols)) {
+      rule <- transform_rule[[num_cols[j]]]
+      if (rule == "log1p") m[, j] <- log1p(m[, j])
+      if (rule == "signed log1p") m[, j] <- sign(m[, j]) * log1p(abs(m[, j]))
+    }
+    m
+  }
+  train_numeric <- transform_numeric(train)
+  medians <- apply(train_numeric, 2, median, na.rm = TRUE)
+
+  impute <- function(m) {
+    for (j in seq_along(num_cols)) m[is.na(m[, j]), j] <- medians[j]
+    m
+  }
+
+  # Step 3: missing tiers become an explicit "Unknown" level; levels are fixed in advance.
+  categorical_block <- function(df) {
+    if (length(cat_cols) == 0) return(NULL)
+    fac <- map(cat_cols, \(p) factor(coalesce(as.character(df[[p]]), "Unknown"),
+                                     levels = c(tier_levels, "Unknown")))
+    names(fac) <- cat_cols
+    fac <- as.data.frame(fac)
+    model.matrix(~ . - 1, data = fac, contrasts.arg = lapply(fac, contrasts, contrasts = FALSE))
+  }
+
+  x_train_raw <- cbind(impute(train_numeric), categorical_block(train))
+  x_valid_raw <- cbind(impute(transform_numeric(valid)), categorical_block(valid))
+
+  # Step 5: remove zero-variance columns (training rows only).
+  sds <- apply(x_train_raw, 2, sd)
+  keep <- sds > 0
+
+  # Step 6: standardize with training means and standard deviations.
+  centers <- colMeans(x_train_raw[, keep, drop = FALSE])
+  scales <- sds[keep]
+  standardize <- function(x) {
+    out <- sweep(x[, keep, drop = FALSE], 2, centers, "-")
+    sweep(out, 2, scales, "/")
+  }
+
+  list(
+    x_train = standardize(x_train_raw),
+    x_valid = standardize(x_valid_raw),
+    dropped_all_missing = all_missing,
+    dropped_zero_variance = colnames(x_train_raw)[!keep]
+  )
+}
+
+fit_ridge <- function(x_train, y_train, lambdas) {
+  warns <- character()
+  fit <- withCallingHandlers(
+    glmnet(x_train, factor(y_train, levels = c(0, 1)), family = "binomial", alpha = 0,
+           lambda = sort(lambdas, decreasing = TRUE), standardize = FALSE,
+           control = list(maxit = ridge_maxit)),
+    warning = function(w) {
+      warns <<- c(warns, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+  list(fit = fit, warnings = unique(warns))
+}
+```
+
+### Fit the Candidate Ridge Configurations (Feature Sets A through D)
+
+```{r}
+baseline_label <- "Constant probability (training prevalence)"
+
+# Flushed progress messages so long fits are visible while they run.
+say <- function(...) {
+  cat(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"), sprintf(...)))
+  flush.console()
+}
+seconds_since <- function(t0) as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+# The checkpoint folder can be set with the option group_modeling.checkpoint_dir or the
+# environment variable GROUP_MODELING_CHECKPOINT_DIR; otherwise a temporary folder is used.
+checkpoint_dir <- getOption(
+  "group_modeling.checkpoint_dir",
+  Sys.getenv("GROUP_MODELING_CHECKPOINT_DIR", file.path(tempdir(), "group_modeling_checkpoints"))
+)
+dir.create(checkpoint_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Fingerprint of the data and of the code and settings that determine every result.
+fingerprint_functions <- c(
+  "prepare_fold", "fit_ridge", "evaluate_scores", "average_precision_tied",
+  "roc_auc_tied", "brier_score", "log_loss", "top_k_tie_aware"
+)
+fingerprint <- list(
+  data = rlang::hash(dev_panel),
+  settings = rlang::hash(list(
+    functions = lapply(mget(fingerprint_functions), deparse),
+    lambda_grid = lambda_grid, ridge_maxit = ridge_maxit, tree_grid = tree_grid,
+    tree_maxdepth = tree_maxdepth, transform_rule = transform_rule,
+    feature_configs = feature_configs, categorical_predictors = categorical_predictors,
+    tier_levels = tier_levels
+  ))
+)
+
+read_checkpoint <- function(name) {
+  path <- file.path(checkpoint_dir, paste0(name, ".rds"))
+  if (!file.exists(path)) return(NULL)
+  saved <- readRDS(path)
+  if (identical(saved$fingerprint, fingerprint)) return(saved)
+  say("%s: stale checkpoint ignored (data or settings changed)", name)
+  NULL
+}
+write_checkpoint <- function(name, payload) {
+  saveRDS(c(list(fingerprint = fingerprint), payload), file.path(checkpoint_dir, paste0(name, ".rds")))
+}
+
+# Constant-probability baseline from the fold's training prevalence.
+run_baseline_case <- function(fold) {
+  name <- sprintf("baseline_fold%d", fold)
+  cached <- read_checkpoint(name)
+  if (!is.null(cached)) {
+    say("fold %d baseline: reused checkpoint", fold)
+    return(cached$metrics)
+  }
+  split <- fold_rows(fold)
+  y_train <- split$train$major_donor_next_fy
+  y_valid <- split$valid$major_donor_next_fy
+  metrics <- evaluate_scores(y_valid, rep(mean(y_train), length(y_valid)), split$valid$current_donor) |>
+    mutate(fold = fold, training_prevalence = mean(y_train))
+  write_checkpoint(name, list(metrics = metrics))
+  say("fold %d baseline: done", fold)
+  metrics
+}
+
+run_ridge_case <- function(fold, cfg) {
+  name <- sprintf("ridge_fold%d_%s", fold, cfg)
+  tag <- sprintf("fold %d config %s", fold, cfg)
+  cached <- read_checkpoint(name)
+  if (!is.null(cached)) {
+    say("%s: reused checkpoint (originally %.1f sec)", tag, sum(cached$record[c("preprocessing_sec", "fit_sec", "predict_sec", "metrics_sec")]))
+    return(cached)
+  }
+  cached_failure <- read_checkpoint(paste0(name, "_FAILED"))
+  if (!is.null(cached_failure)) {
+    say("%s: reused recorded failure (not re-fit)", tag)
+    return(cached_failure)
+  }
+
+  split <- fold_rows(fold)
+  y_train <- split$train$major_donor_next_fy
+  y_valid <- split$valid$major_donor_next_fy
+  donor_flag <- split$valid$current_donor
+
+  say("%s | preprocessing: start", tag)
+  t0 <- Sys.time()
+  prep <- prepare_fold(split$train, split$valid, feature_configs[[cfg]])
+  preprocessing_sec <- seconds_since(t0)
+  say("%s | preprocessing: done in %.2f sec (%d columns)", tag, preprocessing_sec, ncol(prep$x_train))
+
+  say("%s | fitting glmnet over %d penalties: start", tag, length(lambda_grid))
+  t0 <- Sys.time()
+  fit <- fit_ridge(prep$x_train, y_train, lambda_grid)
+  fit_sec <- seconds_since(t0)
+  g <- fit$fit
+  say("%s | fitting: done in %.2f sec (passes = %d, error code = %d, warnings = %d, penalties fitted = %d)",
+      tag, fit_sec, g$npasses, g$jerr, length(fit$warnings), length(g$lambda))
+
+  # Check the fit BEFORE scoring: an incomplete or nonconverged fit is never scored.
+  fit_problems <- c(
+    if (g$jerr != 0) "glmnet error code is not 0",
+    if (length(fit$warnings) > 0) paste("glmnet warning:", paste(fit$warnings, collapse = " | ")),
+    if (!isTRUE(all.equal(sort(g$lambda), sort(lambda_grid)))) "not all declared penalties were fitted"
+  )
+  case_record <- function(predict_sec, metrics_sec, predictions_finite) {
+    tibble(
+      config = cfg, fold = fold,
+      training_rows = nrow(prep$x_train), training_positives = sum(y_train),
+      requested_predictors = length(feature_configs[[cfg]]), columns_used = ncol(prep$x_train),
+      validation_rows = length(y_valid), validation_positives = sum(y_valid),
+      preprocessing_sec, fit_sec, predict_sec, metrics_sec,
+      passes = g$npasses, glmnet_error_code = g$jerr,
+      glmnet_warnings = length(fit$warnings), warning_text = paste(fit$warnings, collapse = " | "),
+      penalties_fitted = length(g$lambda),
+      all_declared_penalties_fitted = isTRUE(all.equal(sort(g$lambda), sort(lambda_grid))),
+      predictions_finite = predictions_finite,
+      dropped_all_missing = paste(prep$dropped_all_missing, collapse = ", "),
+      dropped_zero_variance = paste(prep$dropped_zero_variance, collapse = ", ")
+    )
+  }
+  if (length(fit_problems) > 0) {
+    failure <- list(
+      failed = TRUE,
+      record = case_record(NA_real_, NA_real_, NA),
+      problems = fit_problems
+    )
+    write_checkpoint(paste0(name, "_FAILED"), failure)
+    say("%s | FIT REJECTED and not scored: %s", tag, paste(fit_problems, collapse = "; "))
+    return(failure)
+  }
+
+  say("%s | prediction: start", tag)
+  t0 <- Sys.time()
+  scores <- predict(g, newx = prep$x_valid, s = lambda_grid, type = "response")
+  coefficients <- abs(as.matrix(coef(g, s = lambda_grid))[-1, , drop = FALSE])
+  predict_sec <- seconds_since(t0)
+  say("%s | prediction: done in %.2f sec", tag, predict_sec)
+
+  say("%s | metrics: start", tag)
+  t0 <- Sys.time()
+  metrics <- map_dfr(seq_along(lambda_grid), \(j) {
+    evaluate_scores(y_valid, scores[, j], donor_flag) |>
+      mutate(config = cfg, fold = fold, lambda = lambda_grid[j],
+             max_abs_coefficient = max(coefficients[, j]))
+  })
+  metrics_sec <- seconds_since(t0)
+  say("%s | metrics: done in %.2f sec", tag, metrics_sec)
+
+  record <- case_record(predict_sec, metrics_sec, all(is.finite(scores)))
+
+  # Non-finite predictions or no usable columns also make the case unusable.
+  late_problems <- c(
+    if (!record$predictions_finite) "predictions are not all finite",
+    if (record$columns_used == 0) "no predictor columns"
+  )
+  if (length(late_problems) > 0) {
+    failure <- list(failed = TRUE, record = record, problems = late_problems)
+    write_checkpoint(paste0(name, "_FAILED"), failure)
+    say("%s | CASE REJECTED: %s", tag, paste(late_problems, collapse = "; "))
+    return(failure)
+  }
+
+  result <- list(failed = FALSE, metrics = metrics, record = record)
+  write_checkpoint(name, result)
+  say("%s | checkpoint saved", tag)
+  result
+}
+
+run_tree_case <- function(fold, minbucket) {
+  name <- sprintf("tree_%s_fold%d_minbucket%d", tree_config, fold, minbucket)
+  tag <- sprintf("fold %d tree (config %s) minbucket %d", fold, tree_config, minbucket)
+  cached <- read_checkpoint(name)
+  if (!is.null(cached)) {
+    say("%s: reused checkpoint", tag)
+    return(cached)
+  }
+
+  split <- fold_rows(fold)
+  y_train <- split$train$major_donor_next_fy
+  y_valid <- split$valid$major_donor_next_fy
+  donor_flag <- split$valid$current_donor
+
+  say("%s | preprocessing: start", tag)
+  t0 <- Sys.time()
+  prep <- prepare_fold(split$train, split$valid, feature_configs[[tree_config]])
+  tree_names <- make.names(colnames(prep$x_train), unique = TRUE)
+  train_df <- data.frame(prep$x_train)
+  names(train_df) <- tree_names
+  train_df$y <- factor(y_train, levels = c(0, 1))
+  valid_df <- data.frame(prep$x_valid)
+  names(valid_df) <- tree_names
+  preprocessing_sec <- seconds_since(t0)
+  say("%s | preprocessing: done in %.2f sec (%d columns)", tag, preprocessing_sec, ncol(prep$x_train))
+
+  # Grow at the smallest declared complexity parameter, then prune to each declared value.
+  say("%s | tree growth at cp = %g: start", tag, min(tree_grid$cp))
+  warns <- character()
+  t0 <- Sys.time()
+  grown <- withCallingHandlers(
+    rpart(
+      y ~ ., data = train_df, method = "class",
+      control = rpart.control(
+        cp = min(tree_grid$cp), minbucket = minbucket, minsplit = 2L * minbucket,
+        maxdepth = tree_maxdepth, xval = 0L, maxcompete = 0L, maxsurrogate = 0L
+      )
+    ),
+    warning = function(w) {
+      warns <<- c(warns, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+  growth_sec <- seconds_since(t0)
+  say("%s | tree growth: done in %.2f sec (%d nodes)", tag, growth_sec, nrow(grown$frame))
+
+  rows <- map_dfr(tree_grid$cp[tree_grid$minbucket == minbucket], \(cp) {
+    say("%s cp %g | prune and predict: start", tag, cp)
+    t0 <- Sys.time()
+    pruned <- prune(grown, cp = cp)
+    p <- predict(pruned, valid_df, type = "prob")[, "1"]
+    predict_sec <- seconds_since(t0)
+    say("%s cp %g | prune and predict: done in %.2f sec (%d distinct probabilities, %d splits)",
+        tag, cp, predict_sec, n_distinct(p), sum(pruned$frame$var != "<leaf>"))
+
+    say("%s cp %g | metrics: start", tag, cp)
+    t0 <- Sys.time()
+    m <- evaluate_scores(y_valid, p, donor_flag)
+    metrics_sec <- seconds_since(t0)
+    say("%s cp %g | metrics: done in %.2f sec", tag, cp, metrics_sec)
+
+    m |>
+      mutate(
+        fold = fold, cp = cp, minbucket = minbucket,
+        distinct_predictions = n_distinct(p),
+        fitted_splits = sum(pruned$frame$var != "<leaf>"),
+        constant_predictions = n_distinct(p) == 1,
+        predictions_finite = all(is.finite(p)),
+        training_rows = nrow(train_df), training_positives = sum(y_train),
+        columns_used = ncol(prep$x_train),
+        preprocessing_sec = preprocessing_sec, growth_sec = growth_sec,
+        predict_sec = predict_sec, metrics_sec = metrics_sec,
+        rpart_warnings = length(warns)
+      )
+  })
+
+  if (!all(rows$predictions_finite)) {
+    stop(sprintf("Tree predictions are not finite for %s", tag), call. = FALSE)
+  }
+  result <- list(metrics = rows)
+  write_checkpoint(name, result)
+  say("%s | checkpoint saved", tag)
+  result
+}
+```
+
+```{r}
+baseline_all <- map_dfr(folds$fold, run_baseline_case)
+```
+
+```{r}
+# Candidate ridge configurations. E failed the convergence checks and F was not attempted
+# (see the scope revision); neither has valid performance results.
+candidate_configs <- c("A", "B", "C", "D")
+
+ridge_cases <- expand_grid(fold = folds$fold, config = candidate_configs)
+ridge_runs <- pmap(ridge_cases, \(fold, config) run_ridge_case(fold, config))
+```
+
+```{r}
+fit_audit <- map_dfr(ridge_runs, "record")
+case_status <- ridge_cases |>
+  mutate(failed = map_lgl(ridge_runs, \(r) isTRUE(r$failed)))
+
+# Only configurations with valid fits on all three folds qualify for the mean comparison.
+eligible_configs <- case_status |>
+  group_by(config) |>
+  summarise(valid_folds = sum(!failed), .groups = "drop") |>
+  filter(valid_folds == nrow(folds)) |>
+  pull(config)
+
+ridge_valid <- map_dfr(ridge_runs[!case_status$failed], "metrics")  # every successful case
+ridge_all <- filter(ridge_valid, config %in% eligible_configs)      # eligible configurations only
+
+gt(case_status |>
+  group_by(config) |>
+  summarise(valid_folds = sum(!failed), failed_folds = sum(failed), .groups = "drop")
+)
+```
+
+```{r}
+eligible_configs
+```
+
+### Penalty Selection
+
+```{r}
+lambda_selection <- ridge_all |>
+  group_by(config, lambda) |>
+  summarise(mean_ap = mean(average_precision), .groups = "drop")
+
+# Highest mean average precision; ties go to the stronger penalty (simpler model).
+selected_lambda <- lambda_selection |>
+  group_by(config) |>
+  arrange(desc(mean_ap), desc(lambda), .by_group = TRUE) |>
+  slice(1) |>
+  ungroup() |>
+  transmute(config, selected_lambda = lambda, selected_mean_ap = mean_ap)
+
+gt(lambda_selection |>
+  mutate(mean_ap = round(mean_ap, 5)) |>
+  pivot_wider(names_from = lambda, values_from = mean_ap, names_prefix = "lambda_") |>
+  left_join(selected_lambda, by = "config") |>
+  mutate(config = unname(config_labels[config]))
+)
+```
+
+```{r}
+candidate_ranking <- selected_lambda |>
+  arrange(desc(selected_mean_ap)) |>
+  mutate(ap_gap_to_best = selected_mean_ap - max(selected_mean_ap))
+
+tree_config <- candidate_ranking$config[1]
+
+gt(candidate_ranking |>
+  transmute(
+    configuration = unname(config_labels[config]), selected_lambda,
+    mean_ap = round(selected_mean_ap, 5), ap_gap_to_best = round(ap_gap_to_best, 5)
+  )
+)
+```
+
+```{r}
+tree_cases <- expand_grid(fold = folds$fold, minbucket = sort(unique(tree_grid$minbucket)))
+tree_runs <- pmap(tree_cases, \(fold, minbucket) run_tree_case(fold, minbucket))
+```
+
+### Decision Tree Versus Ridge Logistic Regression (Strongest Candidate)
+
+```{r}
+tree_all <- map_dfr(tree_runs, "metrics")
+
+tree_selection <- tree_all |>
+  group_by(cp, minbucket) |>
+  summarise(
+    mean_ap = mean(average_precision),
+    min_distinct_predictions = min(distinct_predictions),
+    mean_fitted_splits = mean(fitted_splits),
+    constant_in_any_fold = any(distinct_predictions == 1),
+    .groups = "drop"
+  )
+
+selected_tree <- tree_selection |>
+  arrange(desc(mean_ap), desc(cp), desc(minbucket)) |>
+  slice(1)
+
+gt(tree_selection |>
+  mutate(mean_ap = round(mean_ap, 5), mean_fitted_splits = round(mean_fitted_splits, 1))
+)
+```
+
+```{r}
+gt(selected_tree)
+```
+
+### Development Results
+
+```{r}
+tree_label <- sprintf("Decision tree (rpart) on configuration %s", tree_config)
+model_levels <- c(unname(config_labels[eligible_configs]), tree_label, baseline_label)
+
+ridge_selected <- ridge_all |>
+  inner_join(selected_lambda, by = c("config", "lambda" = "selected_lambda")) |>
+  mutate(model = unname(config_labels[config]))
+
+tree_selected <- tree_all |>
+  inner_join(select(selected_tree, cp, minbucket), by = c("cp", "minbucket")) |>
+  mutate(model = tree_label)
+
+dev_results <- bind_rows(
+  ridge_selected,
+  tree_selected,
+  mutate(baseline_all, model = baseline_label)
+) |>
+  mutate(model = factor(model, levels = model_levels)) |>
+  arrange(model, fold)
+
+metric_columns <- c(
+  "average_precision", "roc_auc", "brier", "log_loss",
+  "captured_top100", "precision_top100", "recall_top100", "lift_top100",
+  "captured_top500", "precision_top500", "recall_top500", "lift_top500"
+)
+
+mean_results <- dev_results |>
+  group_by(model) |>
+  summarise(across(all_of(metric_columns), mean), .groups = "drop")
+
+# Every model is scored on the same validation rows in each fold.
+gt(dev_results |>
+  group_by(fold) |>
+  summarise(
+    distinct_row_counts = n_distinct(validation_rows),
+    distinct_positive_counts = n_distinct(validation_positives),
+    validation_rows = first(validation_rows),
+    validation_positives = first(validation_positives)
+  )
+)
+```
+
+### Configuration Status
+
+```{r}
+configuration_status <- tibble(config = names(feature_configs)) |>
+  mutate(
+    configuration = unname(config_labels[config]),
+    predictors = unname(lengths(feature_configs)),
+    status = case_when(
+      config %in% eligible_configs ~ "Successful: valid ridge fits on all three folds",
+      config %in% candidate_configs ~ "Failed on at least one fold: diagnostics recorded, excluded from the mean comparison",
+      config == "E" ~ "Failed the convergence checks on fold 1; troubleshooting stopped, not retried",
+      config == "F" ~ "Not attempted (contains all of E's predictors)",
+      TRUE ~ "Not attempted"
+    ),
+    valid_performance_results = config %in% eligible_configs
+  )
+
+gt(configuration_status)
+```
+
+## Results
+
+### Fold-Level Results
+
+```{r}
+dev_results |>
+  transmute(
+    model, fold,
+    average_precision = round(average_precision, 5),
+    roc_auc = round(roc_auc, 3),
+    brier = signif(brier, 4),
+    log_loss = round(log_loss, 5),
+    # Three significant digits so the small constant-baseline expectations are not shown as zero.
+    captured_top100 = signif(captured_top100, 3),
+    captured_top500 = signif(captured_top500, 3)
+  ) |>
+  gt()
+```
+
+### Mean Results Across Folds
+
+```{r}
+bind_rows(
+  selected_lambda |>
+    transmute(model = unname(config_labels[config]),
+              setting = paste0("ridge lambda = ", selected_lambda)),
+  selected_tree |>
+    transmute(model = tree_label,
+              setting = paste0("cp = ", cp, ", minbucket = ", minbucket, ", maxdepth = ", tree_maxdepth)))
+```
+
+```{r}
+mean_results |>
+  transmute(
+    model,
+    average_precision = round(average_precision, 5),
+    roc_auc = round(roc_auc, 3),
+    brier = signif(brier, 4),
+    log_loss = round(log_loss, 5)
+  ) |>
+  gt()
+```
+
+### Incremental Comparisons
+
+Each row compares the mean across folds of one configuration with another (the first minus the second). Brier score and log loss are errors, so negative differences are favorable for those two columns. The count shows in how many of the three folds the first configuration had the higher average precision. These are point estimates from development folds, not tests of significance.
+
+```{r}
+comparison_pairs <- tribble(
+  ~comparison, ~to, ~from,
+  "B - A (giving history)", "B", "A",
+  "C - A (solicitation)", "C", "A",
+  "D - A (Passport)", "D", "A"
+)
+
+# E - B and F - E are not available: E failed its convergence checks and F was not attempted.
+comparison_pairs <- filter(comparison_pairs, to %in% eligible_configs, from %in% eligible_configs)
+
+fold_metric <- function(cfg, metric) {
+  dev_results |>
+    filter(model == config_labels[[cfg]]) |>
+    arrange(fold) |>
+    pull(all_of(metric))
+}
+
+pmap_dfr(comparison_pairs, function(comparison, to, from) {
+  ap_difference <- fold_metric(to, "average_precision") - fold_metric(from, "average_precision")
+  tibble(
+    comparison,
+    mean_ap_difference = mean(ap_difference),
+    folds_with_higher_ap = sum(ap_difference > 0),
+    roc_auc_difference = mean(fold_metric(to, "roc_auc") - fold_metric(from, "roc_auc")),
+    brier_difference = mean(fold_metric(to, "brier") - fold_metric(from, "brier")),
+    log_loss_difference = mean(fold_metric(to, "log_loss") - fold_metric(from, "log_loss")),
+    top500_captured_difference = mean(fold_metric(to, "captured_top500") - fold_metric(from, "captured_top500"))
+  )
+}) |>
+  mutate(
+    mean_ap_difference = round(mean_ap_difference, 5),
+    roc_auc_difference = round(roc_auc_difference, 4),
+    brier_difference = signif(brier_difference, 3),
+    log_loss_difference = round(log_loss_difference, 5),
+    top500_captured_difference = round(top500_captured_difference, 2)
+  ) |>
+  gt()
+```
+
+### Top-100 and Top-500 Results
+
+```{r}
+mean_results |>
+  transmute(
+    model,
+    captured_top100 = signif(captured_top100, 3),
+    precision_top100 = signif(precision_top100, 3),
+    recall_top100 = signif(recall_top100, 3),
+    lift_top100 = round(lift_top100, 1),
+    captured_top500 = signif(captured_top500, 3),
+    precision_top500 = signif(precision_top500, 3),
+    recall_top500 = signif(recall_top500, 3),
+    lift_top500 = round(lift_top500, 1)
+  ) |>
+  gt()
+```
+
+### Current Donors Versus Zero-Giving Constituents
+
+```{r}
+dev_results |>
+  group_by(model) |>
+  summarise(
+    donor_rows = sum(rows_current_donor),
+    donor_positives = sum(positives_current_donor),
+    donor_mean_ap = mean(ap_current_donor),
+    donor_mean_roc_auc = mean(roc_current_donor),
+    zero_rows = sum(rows_zero_giving),
+    zero_positives = sum(positives_zero_giving),
+    zero_mean_ap = mean(ap_zero_giving),
+    zero_mean_roc_auc = mean(roc_zero_giving),
+    .groups = "drop"
+  ) |>
+  mutate(
+    donor_rows = comma(donor_rows), zero_rows = comma(zero_rows),
+    across(c(donor_mean_ap, zero_mean_ap), \(x) round(x, 5)),
+    across(c(donor_mean_roc_auc, zero_mean_roc_auc), \(x) round(x, 3))
+  ) |>
+  gt()
+```
+
+### Development Average Precision
+
+```{r}
+plot_data <- dev_results |>
+  mutate(
+    model = factor(model, levels = rev(model_levels)),
+    fold_label = factor(
+      paste0("Validate FY", 2021 + fold),
+      levels = paste0("Validate FY", 2022:2024)
+    )
+  )
+
+mean_plot_data <- mean_results |>
+  mutate(model = factor(model, levels = rev(model_levels)))
+
+ggplot(plot_data, aes(y = model)) +
+  geom_col(data = mean_plot_data, aes(x = average_precision), width = 0.6) +
+  geom_point(aes(x = average_precision, color = fold_label), size = 2) +
+  scale_x_continuous(breaks = seq(0, 0.2, by = 0.05)) +
+  labs(x = "Average precision (higher is better)", y = NULL, color = NULL)
+```
+
+## Final Confrimation Plan
+
+```{r}
+# Fixed final specifications, from the development results.
+final_specs <- tribble(
+  ~config, ~role, ~lambda,
+  "A", "Preferred model: provisional four-predictor ridge benchmark", 0.001,
+  "D", "Fixed comparison: benchmark plus the four Passport features", 0.001
+)
+confirmation_year <- 2025L
+confirmation_outcome_year <- 2026L
+n_boot_confirmation <- 200L
+bootstrap_seed <- 6203L
+
+# The fixed penalties must equal the penalties selected in development.
+final_spec_check <- final_specs |>
+  left_join(
+    selected_lambda |> select(config, development_selected_lambda = selected_lambda),
+    by = "config"
+  ) |>
+  mutate(
+    configuration = unname(config_labels[config]),
+    predictors = unname(lengths(feature_configs[config])),
+    matches_development_selection = lambda == development_selected_lambda
+  )
+
+gt(final_spec_check)
+stopifnot(all(final_spec_check$matches_development_selection))
+```
+
+### Confirmation: Build FY2025 Features and Score
+
+```{r}
+confirmation_db_file <- file.path(tempdir(), "group_confirmation.duckdb")
+con2 <- dbConnect(duckdb(), dbdir = confirmation_db_file)
+```
+
+```{r}
+run_sql2 <- function(sql) invisible(dbExecute(con2, sql))
+q2 <- function(sql) dbGetQuery(con2, sql)
+
+run_sql2("CREATE OR REPLACE MACRO fy(d) AS
+  CASE WHEN month(TRY_CAST(d AS DATE)) >= 7
+       THEN year(TRY_CAST(d AS DATE)) + 1 ELSE year(TRY_CAST(d AS DATE)) END")
+duckdb_register(con2, "individual_ids", individuals[, "constituent_id", drop = FALSE])
+
+# Exact duplicates are removed within the outcome year (duplicates share a date).
+run_sql2(sprintf(
+  "CREATE OR REPLACE TABLE payments_outcome AS
+   SELECT DISTINCT * FROM read_csv_auto('%s', header = true, sample_size = -1, nullstr = '')
+   WHERE fy(credit_date) = %d",
+  file.path(data_dir, "unite_payments.csv"), confirmation_outcome_year
+))
+run_sql2(sprintf(
+  "CREATE OR REPLACE TABLE soft_outcome AS
+   SELECT DISTINCT * FROM read_csv_auto('%s', header = true, sample_size = -1, nullstr = '')
+   WHERE fy(\"Credit Date\") = %d",
+  file.path(data_dir, "soft_credits.csv"), confirmation_outcome_year
+))
+
+direct_outcome <- q2(r"---(
+SELECT donor_id AS constituent_id, fy(credit_date)::INTEGER AS fiscal_year,
+       ROUND(SUM(payment_amount)::DOUBLE, 2) AS direct_amount,
+       COUNT(*)::INTEGER AS direct_payment_count
+FROM payments_outcome
+WHERE pledge_gift_status = 'Paid' AND payment_amount > 0
+  AND donor_id IN (SELECT constituent_id FROM individual_ids)
+GROUP BY 1, 2
+)---")
+
+soft_outcome <- q2(r"---(
+SELECT "Soft Credit Constituent ID" AS constituent_id, fy("Credit Date")::INTEGER AS fiscal_year,
+       ROUND(SUM("Credit Amount")::DOUBLE, 2) AS soft_amount,
+       COUNT(*)::INTEGER AS soft_credit_count
+FROM soft_outcome
+WHERE "Credit Amount" > 0
+  AND "Soft Credit Constituent ID" IN (SELECT constituent_id FROM individual_ids)
+GROUP BY 1, 2
+)---")
+
+outcome_year_check <- q2(r"---(
+SELECT COUNT(*) AS payment_rows,
+       COUNT(DISTINCT date_trunc('month', TRY_CAST(credit_date AS DATE))) AS months_present,
+       MIN(TRY_CAST(credit_date AS DATE)) AS first_date, MAX(TRY_CAST(credit_date AS DATE)) AS last_date
+FROM payments_outcome
+)---")
+soft_outcome_rows <- q2("SELECT COUNT(*) AS n FROM soft_outcome")$n
+
+dbDisconnect(con2, shutdown = TRUE)
+unlink(confirmation_db_file)
+
+giving_outcome <- full_join(direct_outcome, soft_outcome, by = c("constituent_id", "fiscal_year")) |>
+  mutate(
+    direct_amount = coalesce(direct_amount, 0),
+    soft_amount = coalesce(soft_amount, 0),
+    direct_payment_count = coalesce(direct_payment_count, 0L),
+    soft_credit_count = coalesce(soft_credit_count, 0L),
+    recognized_amount = round(direct_amount + soft_amount, 2)
+  ) |>
+  select(all_of(names(giving_year)))
+
+# Development giving (FY2021-FY2025) plus FY2026 giving, used only for the next-year columns.
+giving_year_confirmation <- bind_rows(giving_year, giving_outcome)
+
+list(
+  outcome_year_payments = outcome_year_check,
+  outcome_year_soft_credit_rows = soft_outcome_rows,
+  fiscal_years_in_giving_table = sort(unique(giving_year_confirmation$fiscal_year)),
+  duplicate_keys = giving_year_confirmation |> count(constituent_id, fiscal_year) |> filter(n > 1) |> nrow()
+)
+```
+
+### FY2025 Panel from the Same Code
+
+```{r}
+panel_confirmation <- assemble_panel(c(feature_years, confirmation_year), giving_year_confirmation)
+engineered_confirmation <- engineer_panel(panel_confirmation)
+
+confirmation_panel <- engineered_confirmation |>
+  filter(fiscal_year == confirmation_year) |>
+  select_eligible()
+
+# The development years rebuilt through the extended panel must equal the original panel.
+development_rebuilt <- engineered_confirmation |>
+  filter(fiscal_year %in% feature_years) |>
+  select_eligible()
+
+confirmation_counts <- tibble(
+  check = c("Eligible rows", "Positives"),
+  expected = c(185195L, 88L),
+  observed = c(nrow(confirmation_panel), sum(confirmation_panel$major_donor_next_fy))
+) |>
+  mutate(difference = observed - expected, reproduced = difference == 0L)
+
+gt(confirmation_counts)
+```
+
+
+```{r}
+confirmation_checks <- tribble(
+  ~check, ~passed,
+  "Confirmation rows are feature year FY2025 only, with FY2026 outcomes",
+    identical(unique(confirmation_panel$fiscal_year), confirmation_year),
+  "Unique constituent-year keys",
+    nrow(count(confirmation_panel, constituent_id, fiscal_year) |> filter(n > 1)) == 0,
+  "Existence established by FY2025 for every row",
+    all(confirmation_panel$first_activity_fy <= confirmation_year),
+  "Existence evidence uses no activity after FY2025",
+    max(existence$first_activity_fy, na.rm = TRUE) <= last_source_fy,
+  "No FY2026 solicitation or Passport activity in any feature table",
+    max(campaign_fy$fiscal_year, passport_fy$fiscal_year) <= last_source_fy,
+  "FY2026 giving is used only for next-year columns (no FY2026 feature row exists)",
+    !any(panel_confirmation$fiscal_year > confirmation_year),
+  "Every row has current recognized giving >= $0 and < $1,200",
+    all(confirmation_panel$recognized_amount >= 0 & confirmation_panel$recognized_amount < major_threshold),
+  "Target equals next-year recognized giving >= $1,200 (exactly $1,200 is positive)",
+    all(confirmation_panel$major_donor_next_fy == as.integer(confirmation_panel$next_recognized_amount >= major_threshold)),
+  "No organization or SYN-ORPHAN record",
+    !any(confirmation_panel$constituent_id %in% c(excluded_constituents$constituent_id, "SYN-ORPHAN")),
+  "Outcome year FY2026 has payments in all 12 months",
+    outcome_year_check$months_present == 12,
+  "Development panel object unchanged (same fingerprint hash)",
+    identical(rlang::hash(dev_panel), fingerprint$data),
+  "Development years rebuilt through the extended panel equal the original development panel",
+    isTRUE(all.equal(development_rebuilt, dev_panel)),
+  "All development timing and exclusion checks still pass",
+    all(timing_checks$passed)
+)
+
+gt(confirmation_checks)
+```
+
+```{r}
+# Subgroups and Passport coverage in the confirmation rows (counts only).
+confirmation_panel |>
+  group_by(group = if_else(current_donor == 1, "current donor", "zero giving")) |>
+  summarise(
+    rows = n(), positives = sum(major_donor_next_fy),
+    passport_coverage = percent(mean(passport_recorded), accuracy = 0.1), .groups = "drop"
+  )
+```
+
+## Visualizations
+
+```{r}
+# Summarize FY2025 eligible prospects and FY2026 outcomes
+prospect_summary <- confirmation_panel |>
+  mutate(
+    giving_group = if_else(
+      current_donor == 1,
+      "Current Donors ($0-$1,199)",
+      "Zero Giving ($0)"
+    )
+  ) |>
+  group_by(giving_group) |>
+  summarise(
+    eligible_constituents = n(),
+    reached_major_donor = sum(major_donor_next_fy),
+    conversion_rate = reached_major_donor / eligible_constituents,
+    .groups = "drop"
+  )
+
+prospect_summary
+```
+
+```{r}
+ggplot(
+  prospect_summary,
+  aes(
+    x = giving_group,
+    y = eligible_constituents,
+    fill = giving_group
+  )
+) +
+  geom_col(width = 0.65) +
+  geom_text(
+    aes(label = comma(eligible_constituents)),
+    vjust = -0.5,
+    size = 5
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Zero Giving ($0)" = "#2A9D8F",
+      "Current Donors ($0-$1,199)" = "#457B9D"
+    )
+  ) +
+  scale_y_continuous(
+    labels = comma,
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "FY2025 Eligible Prospect Pool",
+    subtitle = "Constituents with recognized giving below $1,200",
+    x = NULL,
+    y = "Number of Constituents"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none"
+  )
+```
+
+```{r}
+ggplot(
+  prospect_summary,
+  aes(
+    x = giving_group,
+    y = reached_major_donor,
+    fill = giving_group
+  )
+) +
+  geom_col(width = 0.65) +
+  geom_text(
+    aes(label = comma(reached_major_donor)),
+    vjust = -0.5,
+    size = 5
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Zero Giving ($0)" = "#2A9D8F",
+      "Current Donors ($0-$1,199.99)" = "#457B9D"
+    )
+  ) +
+  scale_y_continuous(
+    breaks = pretty_breaks(),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title = "FY2026 Major-Donor Conversions",
+    subtitle = "FY2025 eligible constituents who reached $1,200+ in FY2026",
+    x = NULL,
+    y = "Number of Constituents"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none"
+  )
+```
