@@ -13,6 +13,9 @@ library(gt)
 library(yardstick)
 library(glmnet)
 library(rpart)
+library(ggplot2)
+library(scales)
+library(dplyr)
 ```
 
 ```{r}
@@ -948,6 +951,60 @@ gt(dev_panel |>
     minimum_titles_when_recorded = min(total_titles_viewed, na.rm = TRUE)
   )
 )
+```
+
+```{r}
+snapshot_terms <- c(
+  "^age$", "sustainer", "annual_giving_group", "major_donor_class", "primary_constituent_type",
+  "constituent_type", "lifetime_", "previous_fy", "prospect_committed", "^gender$", "marital"
+)
+non_predictor_columns <- c(id_columns, eligibility_column, subgroup_column, audit_columns, outcome_columns)
+
+outcome_years_used <- sort(unique(dev_panel$fiscal_year + 1L))
+
+timing_checks <- tribble(
+  ~check, ~passed,
+  "Feature years are exactly FY2021-FY2024",
+    identical(sort(unique(dev_panel$fiscal_year)), feature_years),
+  "Outcome years are exactly FY2022-FY2025; no FY2025 feature rows or FY2026 outcomes",
+    identical(outcome_years_used, outcome_years) && !any(dev_panel$fiscal_year >= 2025),
+  "No source aggregate contains a fiscal year after FY2025",
+    max(giving_year$fiscal_year, campaign_fy$fiscal_year, passport_fy$fiscal_year) <= last_source_fy,
+  "No predictor is an identifier, audit field, eligibility field, subgroup flag, or outcome column",
+    length(intersect(predictor_columns, non_predictor_columns)) == 0,
+  "No predictor name starts with next_ or is the target",
+    !any(startsWith(predictor_columns, "next_")) && !("major_donor_next_fy" %in% predictor_columns),
+  "No predictor name matches a snapshot or constituent-attribute field",
+    !any(map_lgl(predictor_columns, \(p) any(str_detect(p, snapshot_terms)))),
+  "Every dev_panel column is a declared identifier, predictor, audit, eligibility, subgroup, or outcome column",
+    setequal(names(dev_panel), c(non_predictor_columns, predictor_columns)),
+  "Every predictor is in the feature inventory, and the inventory lists no other feature",
+    setequal(feature_inventory$feature, predictor_columns),
+  "Every eligible row has existence established by its feature year",
+    all(dev_panel$first_activity_fy <= dev_panel$fiscal_year),
+  "Every eligible row has current recognized giving >= $0 and < $1,200",
+    all(dev_panel$recognized_amount >= 0 & dev_panel$recognized_amount < major_threshold),
+  "The target equals next-year recognized giving >= $1,200 (exactly $1,200 is positive)",
+    all(dev_panel$major_donor_next_fy == as.integer(dev_panel$next_recognized_amount >= major_threshold)),
+  "No organization or SYN-ORPHAN record in the panel",
+    !any(dev_panel$constituent_id %in% c(excluded_constituents$constituent_id, "SYN-ORPHAN")),
+  "Prior-modern-year history is unknown (NA) for every FY2021 row",
+    all(is.na(dev_panel$prior_recognized_amount[dev_panel$fiscal_year == 2021])) &&
+      all(is.na(dev_panel$trailing_three_year_slope[dev_panel$fiscal_year == 2021])),
+  "Prior-year solicitation features are NA for every FY2021 row and observed afterward",
+    all(is.na(dev_panel$prior_fy_solicitations[dev_panel$fiscal_year == 2021])) &&
+      all(is.na(dev_panel$prior_fy_campaign_responses[dev_panel$fiscal_year == 2021])) &&
+      !any(is.na(dev_panel$prior_fy_solicitations[dev_panel$fiscal_year > 2021])) &&
+      !any(is.na(dev_panel$prior_fy_campaign_responses[dev_panel$fiscal_year > 2021])),
+  "Trailing solicitation totals cover one observed year in FY2021 and two in FY2022",
+    all(dev_panel$trailing_3_fy_solicitations[dev_panel$fiscal_year == 2021] ==
+          dev_panel$solicitations[dev_panel$fiscal_year == 2021]) &&
+      all(dev_panel$trailing_3_fy_solicitations[dev_panel$fiscal_year == 2022] ==
+            dev_panel$solicitations[dev_panel$fiscal_year == 2022] +
+            dev_panel$prior_fy_solicitations[dev_panel$fiscal_year == 2022])
+)
+
+gt(timing_checks)
 ```
 
 ### Independent Recomputation and Outcome-Year Completeness
@@ -2146,7 +2203,7 @@ prospect_summary <- confirmation_panel |>
   mutate(
     giving_group = if_else(
       current_donor == 1,
-      "Current Donors ($0-$1,199)",
+      "Current Donors ($0-$1,199.99)",
       "Zero Giving ($0)"
     )
   ) |>
@@ -2170,31 +2227,65 @@ ggplot(
     fill = giving_group
   )
 ) +
-  geom_col(width = 0.65) +
+  geom_col(width = 0.55) +
   geom_text(
     aes(label = comma(eligible_constituents)),
-    vjust = -0.5,
-    size = 5
+    vjust = -0.6,
+    size = 6,
+    fontface = "bold",
+    color = "#263238"
   ) +
   scale_fill_manual(
     values = c(
       "Zero Giving ($0)" = "#2A9D8F",
-      "Current Donors ($0-$1,199)" = "#457B9D"
+      "Current Donors ($0-$1,199.99)" = "#457B9D"
     )
   ) +
   scale_y_continuous(
     labels = comma,
-    expand = expansion(mult = c(0, 0.12))
+    expand = expansion(mult = c(0, 0.15))
   ) +
   labs(
     title = "FY2025 Eligible Prospect Pool",
     subtitle = "Constituents with recognized giving below $1,200",
     x = NULL,
-    y = "Number of Constituents"
+    y = "Eligible Constituents"
   ) +
-  theme_minimal(base_size = 13) +
+  theme_minimal(base_size = 16) +
   theme(
-    legend.position = "none"
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E5E9ED",
+      linewidth = 0.4
+    ),
+    axis.text.x = element_text(
+      size = 13,
+      face = "bold",
+      color = "#263238",
+      margin = margin(t = 10)
+    ),
+    axis.text.y = element_text(
+      size = 12,
+      color = "#607D8B"
+    ),
+    axis.title.y = element_text(
+      size = 13,
+      color = "#455A64",
+      margin = margin(r = 12)
+    ),
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "#1D3557"
+    ),
+    plot.subtitle = element_text(
+      size = 13,
+      color = "#607D8B",
+      margin = margin(b = 15)
+    ),
+    plot.margin = margin(20, 20, 15, 15)
   )
 ```
 
@@ -2207,11 +2298,13 @@ ggplot(
     fill = giving_group
   )
 ) +
-  geom_col(width = 0.65) +
+  geom_col(width = 0.55) +
   geom_text(
     aes(label = comma(reached_major_donor)),
-    vjust = -0.5,
-    size = 5
+    vjust = -0.6,
+    size = 6,
+    fontface = "bold",
+    color = "#263238"
   ) +
   scale_fill_manual(
     values = c(
@@ -2220,17 +2313,50 @@ ggplot(
     )
   ) +
   scale_y_continuous(
-    breaks = pretty_breaks(),
+    labels = comma,
+    breaks = pretty_breaks(n = 5),
     expand = expansion(mult = c(0, 0.15))
   ) +
   labs(
     title = "FY2026 Major-Donor Conversions",
-    subtitle = "FY2025 eligible constituents who reached $1,200+ in FY2026",
+    subtitle = "FY2025 eligible prospects who gave $1,200+ in FY2026",
     x = NULL,
-    y = "Number of Constituents"
+    y = "Major-Donor Conversions"
   ) +
-  theme_minimal(base_size = 13) +
+  theme_minimal(base_size = 16) +
   theme(
-    legend.position = "none"
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "#E5E9ED",
+      linewidth = 0.4
+    ),
+    axis.text.x = element_text(
+      size = 13,
+      face = "bold",
+      color = "#263238",
+      margin = margin(t = 10)
+    ),
+    axis.text.y = element_text(
+      size = 12,
+      color = "#607D8B"
+    ),
+    axis.title.y = element_text(
+      size = 13,
+      color = "#455A64",
+      margin = margin(r = 12)
+    ),
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "#1D3557"
+    ),
+    plot.subtitle = element_text(
+      size = 13,
+      color = "#607D8B",
+      margin = margin(b = 15)
+    ),
+    plot.margin = margin(20, 20, 15, 15)
   )
 ```
