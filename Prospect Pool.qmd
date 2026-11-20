@@ -1,0 +1,377 @@
+---
+title: "Historical Major-Donor Conversion and Giving Analysis"
+subtitle: "FY2021–FY2024 feature years | FY2022–FY2025 outcomes"
+format:
+  html:
+    toc: true
+    code-fold: true
+---
+
+## Objective
+
+Compare constituents with **current recognized giving of $1–$1,199.99** against those with **$0 current recognized giving**, and report following-year major-donor conversions, recognized giving, and direct cash giving. A major-donor conversion means following-year recognized giving of at least $1,200. Dollar amounts are historical observations, not incremental revenue caused by modeling.
+
+This is a descriptive analysis of four feature-year cohorts, **not** a model-validation analysis. Constituents may appear in multiple cohorts. FY2025-to-FY2026 is reserved for separate confirmation and is not included here.
+
+## Setup and Source Data
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(DBI)
+library(duckdb)
+library(here)
+library(scales)
+library(gt)
+library(lubridate)
+
+major_threshold <- 1200
+feature_years <- 2021:2024
+outcome_years <- feature_years + 1L
+last_source_fy <- 2025L
+
+data_dir <- here("Data_Files")
+stopifnot(dir.exists(data_dir))
+
+con <- dbConnect(duckdb(), dbdir = file.path(tempdir(), "historical_conversions.duckdb"))
+run_sql <- function(sql) invisible(dbExecute(con, sql))
+q <- function(sql) dbGetQuery(con, sql)
+run_sql("CREATE OR REPLACE MACRO fy(d) AS CASE WHEN month(TRY_CAST(d AS DATE)) >= 7 THEN year(TRY_CAST(d AS DATE)) + 1 ELSE year(TRY_CAST(d AS DATE)) END")
+load_csv <- function(table, file, columns = "*") {
+  path <- normalizePath(file.path(data_dir, file), winslash = "/", mustWork = TRUE)
+  path <- gsub("'", "''", path, fixed = TRUE)
+  run_sql(sprintf("CREATE OR REPLACE TABLE %s AS SELECT %s FROM read_csv_auto('%s', header = true, sample_size = -1, nullstr = '')", table, columns, path))
+}
+load_csv("payments_raw", "unite_payments.csv")
+load_csv("soft_raw", "soft_credits.csv")
+load_csv("constituents_raw", "constituents_w_memberships.csv")
+load_csv("campaign_raw", "campaign_members.csv", "constituent_id, campaign_start_date")
+load_csv("passport_raw", "passport_viewing.txt", "constituent_id, fiscal_year")
+load_csv("legacy_raw", "team_approach_legacy_payments.csv", paste(c("gift_date", "payment_amount", paste0("constituent_id_", 1:7)), collapse = ", "))
+```
+
+## Individual Eligibility
+
+Exclude organizations and unmatched/orphan IDs as in the original development dataset. Spouse grouping is unnecessary because no model split is performed.
+
+```{r}
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE individuals AS
+SELECT "Constituent ID" AS constituent_id, "Spouse Constituent ID" AS spouse_constituent_id
+FROM constituents_raw
+WHERE COALESCE("Constituent ID", '') NOT IN ('', 'SYN-ORPHAN')
+  AND COALESCE("Constituent Type", '') NOT ILIKE '%Organization%'
+  AND COALESCE("Primary Constituent Type", '') NOT ILIKE '%Organization%'
+)---")
+
+```
+
+## Fiscal-Year Giving Aggregation
+
+Direct payments include deduplicated paid positive payments; soft credits include deduplicated positive credits. Recognized giving is the sum of direct payments and soft credits. Legacy gifts establish historical existence only and do not contribute to these giving totals.
+
+```{r}
+run_sql("CREATE OR REPLACE TEMP TABLE payments_dedup AS SELECT DISTINCT * FROM payments_raw")
+run_sql("CREATE OR REPLACE TEMP TABLE soft_dedup AS SELECT DISTINCT * FROM soft_raw")
+
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE direct_fy AS
+SELECT donor_id AS constituent_id, fy(credit_date)::INTEGER AS fiscal_year,
+       ROUND(SUM(payment_amount)::DOUBLE, 2) AS direct_amount,
+       COUNT(*)::INTEGER AS direct_payment_count
+FROM payments_dedup
+WHERE pledge_gift_status = 'Paid' AND payment_amount > 0
+  AND donor_id IN (SELECT constituent_id FROM individuals)
+  AND fy(credit_date) BETWEEN 2021 AND 2025
+GROUP BY 1, 2
+)---")
+
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE soft_fy AS
+SELECT "Soft Credit Constituent ID" AS constituent_id, fy("Credit Date")::INTEGER AS fiscal_year,
+       ROUND(SUM("Credit Amount")::DOUBLE, 2) AS soft_amount,
+       COUNT(*)::INTEGER AS soft_credit_count
+FROM soft_dedup
+WHERE "Credit Amount" > 0
+  AND "Soft Credit Constituent ID" IN (SELECT constituent_id FROM individuals)
+  AND fy("Credit Date") BETWEEN 2021 AND 2025
+GROUP BY 1, 2
+)---")
+```
+
+```{r}
+# A legacy row can list up to seven household members. Unpivoting is used only to link
+# dates to people; amounts and counts are never carried forward.
+legacy_union <- paste(
+  sprintf("SELECT gift_date, payment_amount, constituent_id_%d AS constituent_id FROM legacy_raw WHERE constituent_id_%d IS NOT NULL", 1:7, 1:7),
+  collapse = " UNION ALL "
+)
+run_sql(paste("CREATE OR REPLACE TEMP TABLE legacy_links AS", legacy_union))
+```
+
+
+## Historical Existence
+
+A constituent enters a feature-year cohort only if activity was recorded by that year. Activity may be from payments, soft credits, campaigns, Passport, or legacy gifts. This reproduces the original historical existence rule, including its limitation that an existing person with no prior recorded activity is not counted.
+
+```{r}
+existence_sources <- q(r"---(
+SELECT i.constituent_id,
+       p.payments_first_fy, s.soft_first_fy, c.campaign_first_fy, a.passport_first_fy,
+       l.legacy_first_fy
+FROM individuals i
+LEFT JOIN (SELECT donor_id AS constituent_id, MIN(fy(credit_date))::INTEGER AS payments_first_fy
+           FROM payments_raw WHERE fy(credit_date) <= 2025 GROUP BY 1) p USING (constituent_id)
+LEFT JOIN (SELECT "Soft Credit Constituent ID" AS constituent_id, MIN(fy("Credit Date"))::INTEGER AS soft_first_fy
+           FROM soft_raw WHERE fy("Credit Date") <= 2025 GROUP BY 1) s USING (constituent_id)
+LEFT JOIN (SELECT constituent_id, MIN(fy(campaign_start_date))::INTEGER AS campaign_first_fy
+           FROM campaign_raw WHERE fy(campaign_start_date) <= 2025 GROUP BY 1) c USING (constituent_id)
+LEFT JOIN (SELECT constituent_id, MIN(fiscal_year)::INTEGER AS passport_first_fy
+           FROM passport_raw WHERE fiscal_year <= 2025 GROUP BY 1) a USING (constituent_id)
+LEFT JOIN (SELECT constituent_id,
+                  MIN(fy(gift_date))::INTEGER AS legacy_first_fy
+           FROM legacy_links WHERE gift_date IS NOT NULL GROUP BY 1) l USING (constituent_id)
+)---")
+
+existence <- existence_sources |>
+  mutate(
+    first_activity_fy = pmin(
+      payments_first_fy, soft_first_fy, campaign_first_fy, passport_first_fy, legacy_first_fy,
+      na.rm = TRUE
+    )
+  )
+
+```
+
+## Construct Eligible Constituent-Year Panel
+
+```{r}
+direct_fy <- q("SELECT constituent_id, fiscal_year, direct_amount FROM direct_fy")
+soft_fy <- q("SELECT constituent_id, fiscal_year, soft_amount FROM soft_fy")
+
+giving_year <- full_join(direct_fy, soft_fy, by = c("constituent_id", "fiscal_year")) |>
+  mutate(
+    direct_amount = coalesce(direct_amount, 0),
+    soft_amount = coalesce(soft_amount, 0),
+    recognized_amount = round(direct_amount + soft_amount, 2)
+  )
+
+next_giving <- giving_year |>
+  transmute(
+    constituent_id, fiscal_year = fiscal_year - 1L,
+    next_direct_amount = direct_amount,
+    next_soft_amount = soft_amount,
+    next_recognized_amount = recognized_amount
+  )
+
+dev_panel <- existence |>
+  filter(!is.na(first_activity_fy)) |>
+  select(constituent_id, first_activity_fy) |>
+  crossing(fiscal_year = feature_years) |>
+  filter(first_activity_fy <= fiscal_year) |>
+  left_join(giving_year, by = c("constituent_id", "fiscal_year")) |>
+  mutate(across(c(direct_amount, soft_amount, recognized_amount), ~coalesce(.x, 0))) |>
+  filter(recognized_amount >= 0, recognized_amount < major_threshold) |>
+  left_join(next_giving, by = c("constituent_id", "fiscal_year")) |>
+  mutate(
+    across(c(next_direct_amount, next_soft_amount, next_recognized_amount), ~coalesce(.x, 0)),
+    outcome_fy = fiscal_year + 1L,
+    current_donor = as.integer(recognized_amount > 0),
+    giving_group = if_else(current_donor == 1L, "Current Giving", "No Current Giving"),
+    major_donor_next_fy = as.integer(next_recognized_amount >= major_threshold)
+  ) |>
+  select(constituent_id, fiscal_year, outcome_fy, first_activity_fy,
+         giving_group, current_donor, direct_amount, soft_amount, recognized_amount,
+         next_direct_amount, next_soft_amount, next_recognized_amount, major_donor_next_fy)
+
+stopifnot(
+  nrow(dev_panel) == nrow(distinct(dev_panel, constituent_id, fiscal_year)),
+  all(dev_panel$fiscal_year %in% feature_years),
+  all(dev_panel$outcome_fy == dev_panel$fiscal_year + 1L),
+  all(dev_panel$first_activity_fy <= dev_panel$fiscal_year),
+  all(dev_panel$recognized_amount >= 0 & dev_panel$recognized_amount < major_threshold),
+  all(dev_panel$major_donor_next_fy == as.integer(dev_panel$next_recognized_amount >= major_threshold))
+)
+
+tibble(eligible_constituent_years = nrow(dev_panel),
+       major_donor_conversions = sum(dev_panel$major_donor_next_fy)) |>
+  gt() |>
+  tab_header(title = "Eligible Development Cohorts") |>
+  cols_label(eligible_constituent_years = "Eligible constituent-years",
+             major_donor_conversions = "Major-donor conversions") |>
+  fmt_number(columns = everything(), decimals = 0)
+```
+
+## Historical Conversion and Giving Results
+
+Dollar amounts below are **following-year contributions from constituents who converted to major donors**, not giving from all constituents in the cohort.
+
+```{r}
+historical_conversions <- dev_panel |>
+  group_by(fiscal_year, outcome_fy, giving_group) |>
+  summarise(
+    eligible_constituents = n(),
+    conversions = sum(major_donor_next_fy),
+    conversion_rate = conversions / eligible_constituents,
+    converted_recognized_giving = sum(next_recognized_amount[major_donor_next_fy == 1L]),
+    converted_direct_giving = sum(next_direct_amount[major_donor_next_fy == 1L]),
+    converted_soft_giving = sum(next_soft_amount[major_donor_next_fy == 1L]),
+    .groups = "drop"
+  ) |>
+  arrange(fiscal_year, giving_group)
+
+historical_conversions |>
+  gt(groupname_col = "outcome_fy") |>
+  tab_header(
+    title = "Historical Major-Donor Conversions and Contributions",
+    subtitle = "Following-year giving from converted constituents only"
+  ) |>
+  cols_label(
+    fiscal_year = "Feature FY",
+    giving_group = "Giving group",
+    eligible_constituents = "Eligible",
+    conversions = "Conversions",
+    conversion_rate = "Conversion rate",
+    converted_recognized_giving = "Recognized giving",
+    converted_direct_giving = "Direct giving",
+    converted_soft_giving = "Soft credits"
+  ) |>
+  fmt_number(columns = c(eligible_constituents, conversions), decimals = 0) |>
+  fmt_percent(columns = conversion_rate, decimals = 4) |>
+  fmt_currency(columns = c(converted_recognized_giving,
+                           converted_direct_giving,
+                           converted_soft_giving), currency = "USD", decimals = 2) |>
+  tab_source_note("Outcome FY appears as the row-group heading; each row represents a feature-year giving group.")
+```
+
+## Cumulative Results
+
+```{r}
+historical_totals <- historical_conversions |>
+  group_by(giving_group) |>
+  summarise(
+    eligible_constituent_years = sum(eligible_constituents),
+    total_conversions = sum(conversions),
+    overall_conversion_rate = total_conversions / eligible_constituent_years,
+    total_recognized_giving = sum(converted_recognized_giving),
+    total_direct_giving = sum(converted_direct_giving),
+    total_soft_giving = sum(converted_soft_giving),
+    .groups = "drop"
+  )
+
+historical_totals |>
+  gt() |>
+  tab_header(
+    title = "Cumulative Major-Donor Conversions and Giving",
+    subtitle = "FY2021–FY2024 feature cohorts; repeated constituent-years possible"
+  ) |>
+  cols_label(
+    giving_group = "Giving group",
+    eligible_constituent_years = "Eligible constituent-years",
+    total_conversions = "Conversions",
+    overall_conversion_rate = "Conversion rate",
+    total_recognized_giving = "Recognized giving",
+    total_direct_giving = "Direct giving",
+    total_soft_giving = "Soft credits"
+  ) |>
+  fmt_number(columns = c(eligible_constituent_years, total_conversions), decimals = 0) |>
+  fmt_percent(columns = overall_conversion_rate, decimals = 4) |>
+  fmt_currency(columns = c(total_recognized_giving, total_direct_giving,
+                           total_soft_giving), currency = "USD", decimals = 2)
+```
+
+## Slide-Ready Opportunity Summary
+
+```{r}
+zero_giving_opportunity <- historical_totals |>
+  filter(giving_group == "No Current Giving") |>
+  select(total_conversions, total_recognized_giving, total_direct_giving, total_soft_giving)
+
+zero_giving_opportunity |>
+  gt() |>
+  tab_header(title = "Opportunity Among Constituents With No Current Giving") |>
+  cols_label(
+    total_conversions = "Conversions",
+    total_recognized_giving = "Recognized giving",
+    total_direct_giving = "Direct giving",
+    total_soft_giving = "Soft credits"
+  ) |>
+  fmt_number(columns = total_conversions, decimals = 0) |>
+  fmt_currency(columns = c(total_recognized_giving, total_direct_giving,
+                           total_soft_giving), currency = "USD", decimals = 2)
+
+# Comparison of pooled conversion rates across constituent-year observations
+rate_comparison <- historical_totals |>
+  select(giving_group, overall_conversion_rate) |>
+  pivot_wider(names_from = giving_group, values_from = overall_conversion_rate) |>
+  mutate(current_to_zero_rate_ratio = if_else(
+    `No Current Giving` > 0,
+    `Current Giving` / `No Current Giving`,
+    NA_real_
+  ))
+
+rate_comparison |>
+  gt() |>
+  tab_header(title = "Relative Conversion Efficiency") |>
+  cols_label(
+    `Current Giving` = "Current-giving rate",
+    `No Current Giving` = "Zero-giving rate",
+    current_to_zero_rate_ratio = "Rate ratio"
+  ) |>
+  fmt_percent(columns = c(`Current Giving`, `No Current Giving`), decimals = 4) |>
+  fmt_number(columns = current_to_zero_rate_ratio, decimals = 1) |>
+  cols_width(everything() ~ px(170))
+
+# Shares of historical major-donor conversions and contributions by giving group
+giving_contribution_summary <- historical_totals |>
+  mutate(
+    share_of_conversions = if (
+      sum(total_conversions) > 0
+    ) {
+      total_conversions / sum(total_conversions)
+    } else {
+      NA_real_
+    },
+
+    share_of_recognized_giving = if (
+      sum(total_recognized_giving) > 0
+    ) {
+      total_recognized_giving / sum(total_recognized_giving)
+    } else {
+      NA_real_
+    },
+
+    share_of_direct_giving = if (
+      sum(total_direct_giving) > 0
+    ) {
+      total_direct_giving / sum(total_direct_giving)
+    } else {
+      NA_real_
+    }
+  )
+
+giving_contribution_summary |>
+  gt() |>
+  tab_header(title = "Share of Historical Major-Donor Outcomes") |>
+  cols_label(
+    giving_group = "Giving group",
+    total_conversions = "Conversions",
+    total_recognized_giving = "Recognized giving",
+    total_direct_giving = "Direct giving",
+    share_of_conversions = "Share of conversions",
+    share_of_recognized_giving = "Share of recognized",
+    share_of_direct_giving = "Share of direct"
+  ) |>
+  fmt_number(columns = total_conversions, decimals = 0) |>
+  fmt_currency(columns = c(total_recognized_giving, total_direct_giving),
+               currency = "USD", decimals = 2) |>
+  fmt_percent(columns = starts_with("share_"), decimals = 2)
+```
+
+**Interpretation:** These are observed historical contributions associated with converted constituents who had no recognized giving in the preceding fiscal year. Excluding that population would remove them from the model's candidate pool, but does not establish that their donations would have been lost without the model. Recognized giving may include soft credits and is not interchangeable with cash receipts.
+
+```{r}
+# Close the connection after all queries and summaries have been created.
+dbDisconnect(con, shutdown = TRUE)
+```

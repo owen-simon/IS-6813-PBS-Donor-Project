@@ -1,29 +1,398 @@
 ---
-title: "Predicting Major-Donor Threshold Crossings Using Solicitation Features"
+title: "Individual Major-Donor Modeling: Prospect Selection and Solicitation Features"
+subtitle: "Historical prospect-pool opportunity followed by expanding-window predictive modeling"
 format:
   html:
     toc: true
+    code-fold: true
     embed-resources: true
 execute:
   warning: false
   message: false
 ---
 
-## Objective and Data
+This report follows two connected decisions: **(1) whom to include as eligible prospects**, then **(2) how well solicitation-response predictors help rank those prospects**. The analysis retains constituents with no current recognized giving rather than excluding them solely on that basis. The historical comparison documents their observed future contributions; it does not estimate donations caused by the model.
 
-The objective is to evaluate whether historical solicitation-response features provide additional predictive information for identifying constituents likely to cross the major-donor threshold in the following fiscal year. Four classification algorithms, Logistic Regression, Elastic Net, Random Forest, and XGBoost, are used to assess the incremental predictive value of these features. The findings will inform which solicitation-related predictors should be considered for inclusion in the group's final combined prediction model.
+**Data-source note:** Both the prospect-pool analysis and the modeling section reuse the same DuckDB-derived eligible constituent-year panel (`dev_panel`). Historical giving predictors are constructed from the giving aggregates, and the 23 solicitation predictors are joined from `Data_Files/solicitation_features.csv`. No separate constituent-fiscal-year analytic CSV is required. The campaign response measures are proxies, not causal estimates of solicitation effectiveness.
 
-Crossing the major-donor threshold is defined as giving less than **$1,200** in the feature year and at least **$1,200** in the following fiscal year. Each algorithm is evaluated twice: once using a baseline set of non-solicitation predictors and once with solicitation-response predictors added. The models are compared using expanding-window cross-validation, with average precision as the primary performance metric because major-donor conversions are rare. FY2025 feature rows and FY2026 outcomes are reserved for the group's final combined-model evaluation.
+## 1. Prospect Pool: Objective
 
-The solicitation-response measures require cautious interpretation. A response is identified through a same-constituent, same-marketing-code payment within the fiscal year; this is a proxy for response, not evidence that the solicitation caused the gift. Campaign dates identify fiscal years rather than verified contact dates.
+Compare constituents with **current recognized giving of $1–$1,199.99** against those with **$0 current recognized giving**, and report following-year major-donor conversions, recognized giving, and direct cash giving. A major-donor conversion means following-year recognized giving of at least $1,200. Dollar amounts are historical observations, not incremental revenue caused by modeling.
 
-## Setup
+This first stage is a descriptive analysis of four feature-year cohorts, **not** a model-validation analysis. Constituents may appear in multiple cohorts. FY2025-to-FY2026 is reserved for separate confirmation and is not included here.
 
-```{r setup}
-library(readr)
-library(caret)
+## 2. Prospect Pool: Data Preparation
+
+```{r}
 library(dplyr)
 library(tidyr)
+library(purrr)
+library(DBI)
+library(duckdb)
+library(here)
+library(scales)
+library(gt)
+library(lubridate)
+
+major_threshold <- 1200
+feature_years <- 2021:2024
+outcome_years <- feature_years + 1L
+last_source_fy <- 2025L
+
+data_dir <- here("Data_Files")
+stopifnot(dir.exists(data_dir))
+
+con <- dbConnect(duckdb(), dbdir = file.path(tempdir(), "historical_conversions.duckdb"))
+run_sql <- function(sql) invisible(dbExecute(con, sql))
+q <- function(sql) dbGetQuery(con, sql)
+run_sql("CREATE OR REPLACE MACRO fy(d) AS CASE WHEN month(TRY_CAST(d AS DATE)) >= 7 THEN year(TRY_CAST(d AS DATE)) + 1 ELSE year(TRY_CAST(d AS DATE)) END")
+load_csv <- function(table, file, columns = "*") {
+  path <- normalizePath(file.path(data_dir, file), winslash = "/", mustWork = TRUE)
+  path <- gsub("'", "''", path, fixed = TRUE)
+  run_sql(sprintf("CREATE OR REPLACE TABLE %s AS SELECT %s FROM read_csv_auto('%s', header = true, sample_size = -1, nullstr = '')", table, columns, path))
+}
+load_csv("payments_raw", "unite_payments.csv")
+load_csv("soft_raw", "soft_credits.csv")
+load_csv("constituents_raw", "constituents_w_memberships.csv")
+load_csv("campaign_raw", "campaign_members.csv", "constituent_id, campaign_start_date")
+load_csv("passport_raw", "passport_viewing.txt", "constituent_id, fiscal_year")
+load_csv("legacy_raw", "team_approach_legacy_payments.csv", paste(c("gift_date", "payment_amount", paste0("constituent_id_", 1:7)), collapse = ", "))
+```
+
+### Individual Eligibility
+
+Exclude organizations and unmatched/orphan IDs as in the original development dataset. Spouse grouping is unnecessary because no model split is performed.
+
+```{r}
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE individuals AS
+SELECT "Constituent ID" AS constituent_id, "Spouse Constituent ID" AS spouse_constituent_id
+FROM constituents_raw
+WHERE COALESCE("Constituent ID", '') NOT IN ('', 'SYN-ORPHAN')
+  AND COALESCE("Constituent Type", '') NOT ILIKE '%Organization%'
+  AND COALESCE("Primary Constituent Type", '') NOT ILIKE '%Organization%'
+)---")
+
+```
+
+### Fiscal-Year Giving Aggregation
+
+Direct payments include deduplicated paid positive payments; soft credits include deduplicated positive credits. Recognized giving is the sum of direct payments and soft credits. Legacy gifts establish historical existence only and do not contribute to these giving totals.
+
+```{r}
+run_sql("CREATE OR REPLACE TEMP TABLE payments_dedup AS SELECT DISTINCT * FROM payments_raw")
+run_sql("CREATE OR REPLACE TEMP TABLE soft_dedup AS SELECT DISTINCT * FROM soft_raw")
+
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE direct_fy AS
+SELECT donor_id AS constituent_id, fy(credit_date)::INTEGER AS fiscal_year,
+       ROUND(SUM(payment_amount)::DOUBLE, 2) AS direct_amount,
+       COUNT(*)::INTEGER AS direct_payment_count
+FROM payments_dedup
+WHERE pledge_gift_status = 'Paid' AND payment_amount > 0
+  AND donor_id IN (SELECT constituent_id FROM individuals)
+  AND fy(credit_date) BETWEEN 2019 AND 2025
+GROUP BY 1, 2
+)---")
+
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE soft_fy AS
+SELECT "Soft Credit Constituent ID" AS constituent_id, fy("Credit Date")::INTEGER AS fiscal_year,
+       ROUND(SUM("Credit Amount")::DOUBLE, 2) AS soft_amount,
+       COUNT(*)::INTEGER AS soft_credit_count
+FROM soft_dedup
+WHERE "Credit Amount" > 0
+  AND "Soft Credit Constituent ID" IN (SELECT constituent_id FROM individuals)
+  AND fy("Credit Date") BETWEEN 2019 AND 2025
+GROUP BY 1, 2
+)---")
+```
+
+```{r}
+# A legacy row can list up to seven household members. Unpivoting is used only to link
+# dates to people; amounts and counts are never carried forward.
+legacy_union <- paste(
+  sprintf("SELECT gift_date, payment_amount, constituent_id_%d AS constituent_id FROM legacy_raw WHERE constituent_id_%d IS NOT NULL", 1:7, 1:7),
+  collapse = " UNION ALL "
+)
+run_sql(paste("CREATE OR REPLACE TEMP TABLE legacy_links AS", legacy_union))
+```
+
+
+### Historical Existence
+
+A constituent enters a feature-year cohort only if activity was recorded by that year. Activity may be from payments, soft credits, campaigns, Passport, or legacy gifts. This reproduces the original historical existence rule, including its limitation that an existing person with no prior recorded activity is not counted.
+
+```{r}
+existence_sources <- q(r"---(
+SELECT i.constituent_id,
+       p.payments_first_fy, s.soft_first_fy, c.campaign_first_fy, a.passport_first_fy,
+       l.legacy_first_fy
+FROM individuals i
+LEFT JOIN (SELECT donor_id AS constituent_id, MIN(fy(credit_date))::INTEGER AS payments_first_fy
+           FROM payments_raw WHERE fy(credit_date) <= 2025 GROUP BY 1) p USING (constituent_id)
+LEFT JOIN (SELECT "Soft Credit Constituent ID" AS constituent_id, MIN(fy("Credit Date"))::INTEGER AS soft_first_fy
+           FROM soft_raw WHERE fy("Credit Date") <= 2025 GROUP BY 1) s USING (constituent_id)
+LEFT JOIN (SELECT constituent_id, MIN(fy(campaign_start_date))::INTEGER AS campaign_first_fy
+           FROM campaign_raw WHERE fy(campaign_start_date) <= 2025 GROUP BY 1) c USING (constituent_id)
+LEFT JOIN (SELECT constituent_id, MIN(fiscal_year)::INTEGER AS passport_first_fy
+           FROM passport_raw WHERE fiscal_year <= 2025 GROUP BY 1) a USING (constituent_id)
+LEFT JOIN (SELECT constituent_id,
+                  MIN(fy(gift_date))::INTEGER AS legacy_first_fy
+           FROM legacy_links WHERE gift_date IS NOT NULL GROUP BY 1) l USING (constituent_id)
+)---")
+
+existence <- existence_sources |>
+  mutate(
+    first_activity_fy = pmin(
+      payments_first_fy, soft_first_fy, campaign_first_fy, passport_first_fy, legacy_first_fy,
+      na.rm = TRUE
+    )
+  )
+
+```
+
+### Eligible Constituent-Year Panel
+
+```{r}
+direct_fy <- q("SELECT constituent_id, fiscal_year, direct_amount FROM direct_fy")
+soft_fy <- q("SELECT constituent_id, fiscal_year, soft_amount FROM soft_fy")
+
+giving_year <- full_join(direct_fy, soft_fy, by = c("constituent_id", "fiscal_year")) |>
+  mutate(
+    direct_amount = coalesce(direct_amount, 0),
+    soft_amount = coalesce(soft_amount, 0),
+    recognized_amount = round(direct_amount + soft_amount, 2)
+  )
+
+next_giving <- giving_year |>
+  transmute(
+    constituent_id, fiscal_year = fiscal_year - 1L,
+    next_direct_amount = direct_amount,
+    next_soft_amount = soft_amount,
+    next_recognized_amount = recognized_amount
+  )
+
+dev_panel <- existence |>
+  filter(!is.na(first_activity_fy)) |>
+  select(constituent_id, first_activity_fy) |>
+  crossing(fiscal_year = feature_years) |>
+  filter(first_activity_fy <= fiscal_year) |>
+  left_join(giving_year, by = c("constituent_id", "fiscal_year")) |>
+  mutate(across(c(direct_amount, soft_amount, recognized_amount), ~coalesce(.x, 0))) |>
+  filter(recognized_amount >= 0, recognized_amount < major_threshold) |>
+  left_join(next_giving, by = c("constituent_id", "fiscal_year")) |>
+  mutate(
+    across(c(next_direct_amount, next_soft_amount, next_recognized_amount), ~coalesce(.x, 0)),
+    outcome_fy = fiscal_year + 1L,
+    current_donor = as.integer(recognized_amount > 0),
+    giving_group = if_else(current_donor == 1L, "Current Giving", "No Current Giving"),
+    major_donor_next_fy = as.integer(next_recognized_amount >= major_threshold)
+  ) |>
+  select(constituent_id, fiscal_year, outcome_fy, first_activity_fy,
+         giving_group, current_donor, direct_amount, soft_amount, recognized_amount,
+         next_direct_amount, next_soft_amount, next_recognized_amount, major_donor_next_fy)
+
+stopifnot(
+  nrow(dev_panel) == nrow(distinct(dev_panel, constituent_id, fiscal_year)),
+  all(dev_panel$fiscal_year %in% feature_years),
+  all(dev_panel$outcome_fy == dev_panel$fiscal_year + 1L),
+  all(dev_panel$first_activity_fy <= dev_panel$fiscal_year),
+  all(dev_panel$recognized_amount >= 0 & dev_panel$recognized_amount < major_threshold),
+  all(dev_panel$major_donor_next_fy == as.integer(dev_panel$next_recognized_amount >= major_threshold))
+)
+
+tibble(eligible_constituent_years = nrow(dev_panel),
+       major_donor_conversions = sum(dev_panel$major_donor_next_fy)) |>
+  gt() |>
+  tab_header(title = "Eligible Development Cohorts") |>
+  cols_label(eligible_constituent_years = "Eligible constituent-years",
+             major_donor_conversions = "Major-donor conversions") |>
+  fmt_number(columns = everything(), decimals = 0)
+```
+
+## 3. Prospect Pool: Historical Conversions and Giving
+
+Dollar amounts below are **following-year contributions from constituents who converted to major donors**, not giving from all constituents in the cohort.
+
+```{r}
+historical_conversions <- dev_panel |>
+  group_by(fiscal_year, outcome_fy, giving_group) |>
+  summarise(
+    eligible_constituents = n(),
+    conversions = sum(major_donor_next_fy),
+    conversion_rate = conversions / eligible_constituents,
+    converted_recognized_giving = sum(next_recognized_amount[major_donor_next_fy == 1L]),
+    converted_direct_giving = sum(next_direct_amount[major_donor_next_fy == 1L]),
+    converted_soft_giving = sum(next_soft_amount[major_donor_next_fy == 1L]),
+    .groups = "drop"
+  ) |>
+  arrange(fiscal_year, giving_group)
+
+historical_conversions |>
+  gt(groupname_col = "outcome_fy") |>
+  tab_header(
+    title = "Historical Major-Donor Conversions and Contributions",
+    subtitle = "Following-year giving from converted constituents only"
+  ) |>
+  cols_label(
+    fiscal_year = "Feature FY",
+    giving_group = "Giving group",
+    eligible_constituents = "Eligible",
+    conversions = "Conversions",
+    conversion_rate = "Conversion rate",
+    converted_recognized_giving = "Recognized giving",
+    converted_direct_giving = "Direct giving",
+    converted_soft_giving = "Soft credits"
+  ) |>
+  fmt_number(columns = c(eligible_constituents, conversions), decimals = 0) |>
+  fmt_percent(columns = conversion_rate, decimals = 4) |>
+  fmt_currency(columns = c(converted_recognized_giving,
+                           converted_direct_giving,
+                           converted_soft_giving), currency = "USD", decimals = 2) |>
+  tab_source_note("Outcome FY appears as the row-group heading; each row represents a feature-year giving group.")
+```
+
+### Cumulative Results
+
+```{r}
+historical_totals <- historical_conversions |>
+  group_by(giving_group) |>
+  summarise(
+    eligible_constituent_years = sum(eligible_constituents),
+    total_conversions = sum(conversions),
+    overall_conversion_rate = total_conversions / eligible_constituent_years,
+    total_recognized_giving = sum(converted_recognized_giving),
+    total_direct_giving = sum(converted_direct_giving),
+    total_soft_giving = sum(converted_soft_giving),
+    .groups = "drop"
+  )
+
+historical_totals |>
+  gt() |>
+  tab_header(
+    title = "Cumulative Major-Donor Conversions and Giving",
+    subtitle = "FY2021–FY2024 feature cohorts; repeated constituent-years possible"
+  ) |>
+  cols_label(
+    giving_group = "Giving group",
+    eligible_constituent_years = "Eligible constituent-years",
+    total_conversions = "Conversions",
+    overall_conversion_rate = "Conversion rate",
+    total_recognized_giving = "Recognized giving",
+    total_direct_giving = "Direct giving",
+    total_soft_giving = "Soft credits"
+  ) |>
+  fmt_number(columns = c(eligible_constituent_years, total_conversions), decimals = 0) |>
+  fmt_percent(columns = overall_conversion_rate, decimals = 4) |>
+  fmt_currency(columns = c(total_recognized_giving, total_direct_giving,
+                           total_soft_giving), currency = "USD", decimals = 2)
+```
+
+### Opportunity Summary
+
+```{r}
+zero_giving_opportunity <- historical_totals |>
+  filter(giving_group == "No Current Giving") |>
+  select(total_conversions, total_recognized_giving, total_direct_giving, total_soft_giving)
+
+zero_giving_opportunity |>
+  gt() |>
+  tab_header(title = "Opportunity Among Constituents With No Current Giving") |>
+  cols_label(
+    total_conversions = "Conversions",
+    total_recognized_giving = "Recognized giving",
+    total_direct_giving = "Direct giving",
+    total_soft_giving = "Soft credits"
+  ) |>
+  fmt_number(columns = total_conversions, decimals = 0) |>
+  fmt_currency(columns = c(total_recognized_giving, total_direct_giving,
+                           total_soft_giving), currency = "USD", decimals = 2)
+
+# Comparison of pooled conversion rates across constituent-year observations
+rate_comparison <- historical_totals |>
+  select(giving_group, overall_conversion_rate) |>
+  pivot_wider(names_from = giving_group, values_from = overall_conversion_rate) |>
+  mutate(current_to_zero_rate_ratio = if_else(
+    `No Current Giving` > 0,
+    `Current Giving` / `No Current Giving`,
+    NA_real_
+  ))
+
+rate_comparison |>
+  gt() |>
+  tab_header(title = "Relative Conversion Efficiency") |>
+  cols_label(
+    `Current Giving` = "Current-giving rate",
+    `No Current Giving` = "Zero-giving rate",
+    current_to_zero_rate_ratio = "Rate ratio"
+  ) |>
+  fmt_percent(columns = c(`Current Giving`, `No Current Giving`), decimals = 4) |>
+  fmt_number(columns = current_to_zero_rate_ratio, decimals = 1) |>
+  cols_width(everything() ~ px(170))
+
+# Shares of historical major-donor conversions and contributions by giving group
+giving_contribution_summary <- historical_totals |>
+  mutate(
+    share_of_conversions = if (
+      sum(total_conversions) > 0
+    ) {
+      total_conversions / sum(total_conversions)
+    } else {
+      NA_real_
+    },
+
+    share_of_recognized_giving = if (
+      sum(total_recognized_giving) > 0
+    ) {
+      total_recognized_giving / sum(total_recognized_giving)
+    } else {
+      NA_real_
+    },
+
+    share_of_direct_giving = if (
+      sum(total_direct_giving) > 0
+    ) {
+      total_direct_giving / sum(total_direct_giving)
+    } else {
+      NA_real_
+    }
+  )
+
+giving_contribution_summary |>
+  gt() |>
+  tab_header(title = "Share of Historical Major-Donor Outcomes") |>
+  cols_label(
+    giving_group = "Giving group",
+    total_conversions = "Conversions",
+    total_recognized_giving = "Recognized giving",
+    total_direct_giving = "Direct giving",
+    share_of_conversions = "Share of conversions",
+    share_of_recognized_giving = "Share of recognized",
+    share_of_direct_giving = "Share of direct"
+  ) |>
+  fmt_number(columns = total_conversions, decimals = 0) |>
+  fmt_currency(columns = c(total_recognized_giving, total_direct_giving),
+               currency = "USD", decimals = 2) |>
+  fmt_percent(columns = starts_with("share_"), decimals = 2)
+```
+
+**Interpretation:** These are observed historical contributions associated with converted constituents who had no recognized giving in the preceding fiscal year. Excluding that population would remove them from the model's candidate pool, but does not establish that their donations would have been lost without the model. Recognized giving may include soft credits and is not interchangeable with cash receipts.
+
+```{r}
+# Close the connection after all queries and summaries have been created.
+dbDisconnect(con, shutdown = TRUE)
+```
+
+
+## 4. Modeling Population and Analytic Data
+
+The historical results motivate **including both current-giving and zero-current-giving eligible constituents**. The modeling stage uses all eligible development-year constituent records for validation; within each training fold, it retains all positives and samples negatives at up to 50 per positive to reduce computational cost. Therefore, "everyone" refers to the **eligible prospect population and validation pool**, not necessarily every negative observation used in fitting.
+
+The modeling stage reuses `dev_panel` constructed from the DuckDB source tables above. Historical giving predictors are computed from fiscal-year aggregates, and the 23 solicitation features are joined by constituent and fiscal year. No separate `constituent_fiscal_year_analytic.csv` is needed. FY2025 features and FY2026 outcomes remain reserved for the group's final evaluation.
+
+```{r modeling_setup}
+library(caret)
 library(readr)
 library(tibble)
 library(ggplot2)
@@ -31,32 +400,94 @@ library(pROC)
 library(glmnet)
 library(randomForest)
 library(xgboost)
-library(gt)
 
 options(tibble.print_max = Inf, tibble.width = Inf)
 RANDOM_SEED <- 42
 ```
 
-```{r load_data}
-# Load the analytic dataset
-analytic <- read_csv(
-  "Data_Files/constituent_fiscal_year_analytic.csv",
-  show_col_types = FALSE
-)
+### Historical Giving Features
 
-# Keep eligible constituents from development years
-dev <- analytic %>%
-  filter(
-    fiscal_year %in% 2021:2024,
-    annual_giving < 1200,
-    !is.na(major_donor_next_fy)
-  )
+Compute giving history on a complete FY2019–FY2024 constituent-year grid before selecting eligible prospects. This preserves prior giving even in years when the constituent would not qualify as an eligible prospect. The source queries include FY2019–FY2025 where records exist. If earlier fiscal years are absent from the underlying files, the corresponding historical values are treated as zero, so early-year lag features may be incomplete.
 
-# Remove unfiltered data
-rm(analytic)
+```{r historical_model_features}
+giving_history <- dev_panel |>
+  distinct(constituent_id) |>
+  tidyr::crossing(fiscal_year = 2019:2024) |>
+  left_join(
+    giving_year |>
+      select(constituent_id, fiscal_year, recognized_amount, direct_amount, soft_amount),
+    by = c("constituent_id", "fiscal_year")
+  ) |>
+  mutate(across(c(recognized_amount, direct_amount, soft_amount), ~coalesce(.x, 0))) |>
+  arrange(constituent_id, fiscal_year) |>
+  group_by(constituent_id) |>
+  mutate(
+    prior_fy_giving = lag(recognized_amount, default = 0),
+    two_fy_prior_giving = lag(recognized_amount, 2, default = 0),
+    trailing_3_fy_giving = recognized_amount + prior_fy_giving + two_fy_prior_giving,
+    giving_trend_vs_prior_fy = recognized_amount - prior_fy_giving,
+    prior_giving_years = lag(cumsum(recognized_amount > 0), default = 0),
+    prior_max_fy_giving = lag(cummax(recognized_amount), default = 0)
+  ) |>
+  ungroup() |>
+  filter(fiscal_year %in% feature_years) |>
+  select(constituent_id, fiscal_year, prior_fy_giving, two_fy_prior_giving,
+         trailing_3_fy_giving, giving_trend_vs_prior_fy,
+         prior_giving_years, prior_max_fy_giving)
+
+dev <- dev_panel |>
+  left_join(giving_history, by = c("constituent_id", "fiscal_year")) |>
+  mutate(annual_giving = recognized_amount)
 ```
 
-## Temporal Validation
+### Solicitation Features
+
+Run the 23-feature solicitation engineering script once from the repository root (for example, `python Feature_Engineering.py`). That script creates `Data_Files/solicitation_features.csv` with 23 solicitation predictors, keyed by `constituent_id` and `fiscal_year`. This is a feature-only table, not a separate analytic panel.
+
+```{r join_solicitation_features}
+solicitation_path <- here::here("Data_Files", "solicitation_features.csv")
+if (!file.exists(solicitation_path)) {
+  stop("Missing solicitation feature table. Run the 23-feature Feature_Engineering.py script first")
+}
+
+solicitation_data <- readr::read_csv(solicitation_path, show_col_types = FALSE,
+                                    col_types = cols(constituent_id = col_character(), .default = col_guess()))
+
+solicitation_columns <- c(
+  "trailing_3_fy_solicitations", "campaign_response_rate", "solicitations_digital",
+  "prior_fy_solicitations", "solicitations", "trailing_3_fy_response_rate",
+  "solicitations_miscellaneous", "trailing_3_fy_campaign_responses", "unique_campaigns_solicited",
+  "campaign_codes_linked", "responses_miscellaneous", "solicitations_mail",
+  "solicitations_email", "prior_fy_campaign_responses", "campaign_responses",
+  "solicitations_phone", "solicitations_in_person", "responses_mail",
+  "responses_phone", "responses_email", "responses_digital",
+  "responses_in_person", "campaign_code_link_rate"
+)
+stopifnot(all(c("constituent_id", "fiscal_year", solicitation_columns) %in%
+              names(solicitation_data)))
+stopifnot(!anyDuplicated(solicitation_data[c("constituent_id", "fiscal_year")]))
+
+dev <- dev |>
+  mutate(constituent_id = as.character(constituent_id)) |>
+  left_join(
+    solicitation_data |>
+      select(constituent_id, fiscal_year, all_of(solicitation_columns)),
+    by = c("constituent_id", "fiscal_year"),
+    relationship = "many-to-one"
+  )
+
+# Zero exposures and response counts for constituents without campaign rows.
+count_features <- setdiff(solicitation_columns,
+                          c("campaign_response_rate", "trailing_3_fy_response_rate", "campaign_code_link_rate"))
+dev <- dev |>
+  mutate(across(all_of(count_features), ~coalesce(.x, 0)))
+
+stopifnot(nrow(dev) == nrow(dev_panel),
+          !anyDuplicated(dev[c("constituent_id", "fiscal_year")]),
+          all(dev$major_donor_next_fy %in% 0:1))
+```
+
+## 5. Solicitation Modeling: Temporal Validation
 
 Three expanding-window folds test whether models trained on earlier years can predict outcomes in a later year. The first trains on FY2021 features and validates on FY2022 features (FY2023 outcomes); the second trains on FY2021 and FY2022 features and validates on FY2023 features (FY2024 outcomes); the third trains on FY2021 through FY2023 features and validates on FY2024 features (FY2025 outcomes).
 
@@ -73,41 +504,31 @@ folds <- tibble(
 gt(folds)
 ```
 
-## Predictor Sets
+### Predictor Sets
 
-To evaluate the incremental predictive value of solicitation-response information, each model is fitted with two predictor sets on the same eligible constituent-years. The baseline includes 16 non-solicitation predictors, while the expanded set adds 23 solicitation-related predictors covering solicitation counts, response measures, campaign activity, and historical rates. Numeric predictors are selected after excluding identifiers, the target, future-year fields, and specified snapshot and cultivation fields. The comparison therefore tests whether adding solicitation-related variables improves predictions beyond the baseline predictors.
+To evaluate the incremental predictive value of solicitation-response information, each model is fitted with two predictor sets on the same eligible constituent-years. The baseline uses giving-history predictors constructed from the DuckDB data, while the expanded set adds 23 solicitation-related predictors covering solicitation counts, response measures, campaign activity, and historical rates. Predictors are explicitly selected from 10 giving-related variables and 23 solicitation-related variables. Identification fields, future-year outcomes, snapshots, and cultivation fields are excluded. The comparison therefore tests whether adding solicitation-related variables improves predictions beyond the baseline predictors.
 
 ```{r predictors}
-# Remove fields that could leak future information or identify a constituent.
-excluded <- grepl(
-  "^next_fy_|_snapshot$|^cultivation_",
-  names(dev)
-) |
-  names(dev) %in% c(
-    "constituent_id",
-    "fiscal_year",
-    "data_split",
-    "major_donor_next_fy"
-  )
-
-# Keep numeric predictors and identify every solicitation-related feature.
-candidates <- names(dev)[!excluded & vapply(dev, is.numeric, logical(1))]
-solicitation <- candidates[grepl(
-  "^(solicitations|responses|campaign_|unique_campaigns_solicited|prior_fy_solicitations|prior_fy_campaign_responses|trailing_3_fy_solicitations|trailing_3_fy_campaign_responses|trailing_3_fy_response_rate)",
-  candidates
-)]
-
-# The two sets differ only in whether solicitation features are included.
-feature_sets <- list(
-  without_solicitation = setdiff(candidates, solicitation),
-  with_solicitation = candidates
+# Explicitly whitelist predictors available at the end of the feature year.
+# Do not include next-year giving, outcome, eligibility, or identification fields.
+baseline_features <- c(
+  "annual_giving", "direct_amount", "soft_amount", "current_donor",
+  "prior_fy_giving", "two_fy_prior_giving", "trailing_3_fy_giving",
+  "giving_trend_vs_prior_fy", "prior_giving_years", "prior_max_fy_giving"
 )
+stopifnot(all(c(baseline_features, solicitation_columns) %in% names(dev)))
+
+feature_sets <- list(
+  without_solicitation = baseline_features,
+  with_solicitation = c(baseline_features, solicitation_columns)
+)
+solicitation <- solicitation_columns
 
 gt(tibble(feature_set = names(feature_sets), predictors = lengths(feature_sets)))
 ```
 
 
-## Training Preparation
+### Training Preparation
 
 Major-donor conversions are uncommon, so each training fold retains every positive case and randomly samples up to 50 negative cases per positive case to reduce computation. Validation uses every eligible observation, preserving the actual outcome frequency. Missing predictor values are replaced with medians calculated from the sampled training data, and predictors that are constant in that sample are removed. These preprocessing decisions are then applied to the validation data.
 
@@ -158,7 +579,7 @@ correct_probability <- function(probability, population_prior, sample_prior) {
 ```
 
 
-## Model Training
+## 6. Solicitation Modeling: Training
 
 Four classification algorithms are compared: Logistic Regression as a conventional benchmark, Elastic Net as a regularized logistic regression model, Random Forest as a bagged tree ensemble, and XGBoost as a gradient-boosted tree ensemble. Each algorithm is fitted separately for both predictor sets across three chronological validation folds, producing 24 model fits in total.
 
@@ -348,7 +769,7 @@ predictions <- bind_rows(lapply(seq_len(nrow(folds)), function(fold) {
 }))
 ```
 
-## Model Evaluation and Comparison
+## 7. Solicitation Modeling: Evaluation
 
 Each model's predictions are evaluated against observed next-year major-donor conversions using average precision, ROC AUC, and Brier score. **Average precision** is the primary selection metric because it measures how effectively a model ranks rare positive cases. ROC AUC measures discrimination between positive and negative cases, while the Brier score measures squared probability error (lower is better).
 
@@ -464,9 +885,7 @@ model_summary %>%
   )
 ```
 
-XGBoost with solicitation-response predictors achieved the highest mean average precision (0.192), followed by Random Forest with solicitation predictors (0.185) and XGBoost without solicitation predictors (0.184). Adding solicitation features improved XGBoost's mean average precision from 0.184 to 0.192 and Random Forest's from 0.156 to 0.185. Elastic Net improved only slightly, from 0.176 to 0.177, while Logistic Regression declined from 0.158 to 0.148.
-
-XGBoost with solicitation features also achieved the highest mean ROC AUC (0.941) and lowest mean Brier score (0.000233). These results suggest that solicitation-response information provides incremental predictive value for some algorithms, particularly tree-based ensembles. However, the improvements are modest for XGBoost, and performance should be interpreted cautiously because the evaluation includes only three chronological validation folds.
+The table above reports the results for the predictors built in this document. Compare the with- and without-solicitation configurations using mean average precision as the primary metric. Earlier results from a different feature-engineering pipeline are not assumed to reproduce here.
 
 ### Highlight: Best-Performing Models
 
@@ -500,11 +919,11 @@ best_models %>%
   fmt_number(columns = value, decimals = 4)
 ```
 
-XGBoost with solicitation-response predictors achieved the best mean performance across all three evaluation metrics: average precision (0.1916), ROC AUC (0.9406), and Brier score (approximately 0.000233). Because average precision is the primary selection metric, this configuration is selected as the leading development-stage model. However, its advantage over competing configurations is relatively small, and these results do not establish that it will consistently outperform alternatives on future data.
+Use the computed `best_models` table above to identify the leading configuration for each metric. Select the development-stage model by mean average precision, while checking ROC AUC and Brier score for context.
 
-## Solicitation-Response Feature Importance
+## 8. Solicitation Feature Importance
 
-Because XGBoost with solicitation-response predictors achieved the highest mean average precision during temporal validation, it is used to examine which solicitation-related features contribute most to prediction. An additional XGBoost model is fitted using all FY2021–FY2024 development data, with the same preprocessing, negative sampling strategy, and hyperparameters as the validation models.
+To examine the solicitation predictors in XGBoost, it is used to examine which solicitation-related features contribute most to prediction. An additional XGBoost model is fitted using all FY2021–FY2024 development data, with the same preprocessing, negative sampling strategy, and hyperparameters as the validation models.
 
 Feature importance is measured using **gain**, which represents the relative improvement in XGBoost's training objective associated with splits using each predictor. The first plot displays feature importance across all predictors, while the second focuses specifically on solicitation-related predictors. Both plots use gain values from the same fitted model, allowing their relative contributions to be compared directly.
 
@@ -578,7 +997,7 @@ ggplot(
   theme_minimal()
 ```
 
-The all-features plot shows that historical giving is substantially more influential than solicitation activity. **Trailing three-year giving**, **annual giving**, and **prior-year giving** are the three most important predictors, with trailing three-year giving contributing the greatest gain. This makes sense given that constituents with a history of higher and more consistent giving are likely to be stronger candidates for future major-donor conversions.
+Interpret the plot above using the newly fitted model. Gain measures relative split contribution and does not establish causation.
 
 ```{r}
 # Identify solicitation-related features
@@ -602,16 +1021,12 @@ ggplot(
 
 ```
 
-Among solicitation-related predictors, **trailing three-year solicitations** has the highest importance, followed by **campaign response rate**, **digital solicitations**, **prior-year solicitations**, and **current-year solicitations**. Trailing three-year solicitations also ranks fifth among all predictors, indicating that historical solicitation activity provides information used by the model beyond giving history.
+The solicitation-only plot identifies which solicitation predictors the newly fitted XGBoost model uses most. Correlated predictors can share importance, and gain does not measure the causal effect of solicitation. The held-out comparison remains the primary evidence of incremental predictive value.
 
-However, the importance of individual solicitation predictors remains relatively small compared with the dominant giving-history variables. Correlated predictors may share importance, and gain does not establish the direction or causal effect of a predictor's relationship with future giving. The incremental predictive value of solicitation-response information is therefore better assessed through the held-out validation comparisons than through feature importance alone.
+## 9. Conclusions
 
-## Conclusion
+The prospect-pool analysis compares the observed following-year conversion rates for eligible current-giving and zero-current-giving constituents. Both groups are retained for the modeling comparison.
 
-Across three chronological validation folds, adding historical solicitation-response features modestly improved predictive performance, particularly for tree-based models. XGBoost average precision increased from 0.184 to 0.192, suggesting that solicitation history provides additional predictive information beyond historical giving behavior.
+The temporal validation results above determine whether the 23 solicitation predictors improve average precision relative to the same model trained only on giving-history features. Because the predictor definitions and population differ from the earlier standalone modeling pipeline, previously reported performance values should not be copied into this report without rerunning and verifying them.
 
-Feature importance identified trailing three-year solicitation count, campaign response rate, and digital solicitation activity as the most informative solicitation-related predictors. However, historical giving remained the dominant source of predictive information.
-
-These findings support carrying solicitation-response features forward for evaluation in the group's combined major-donor prediction model. Their incremental contribution should be reassessed alongside the additional features developed by other group members, since some solicitation variables may contain overlapping information.
-
-Overall, historical solicitation activity appears to provide modest supplementary predictive value for identifying potential future major donors, although these associations do not establish that solicitation activity *causes* increased giving.
+Solicitation-response features describe historical associations and should not be interpreted as causal effects of outreach on giving.
