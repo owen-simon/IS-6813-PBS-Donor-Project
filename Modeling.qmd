@@ -11,17 +11,20 @@ execute:
   message: false
 ---
 
-This report follows two connected decisions: **(1) whom to include as eligible prospects**, then **(2) how well solicitation-response predictors help rank those prospects**. The analysis retains constituents with no current recognized giving rather than excluding them solely on that basis. The historical comparison documents their observed future contributions; it does not estimate donations caused by the model.
+This report follows three analyses: historical conversion patterns by current-year giving, baseline modeling by prospect population, and incremental predictive value of solicitation features. All eligible prospects have current-year recognized giving below $1,200. The FY2025-feature/FY2026-outcome holdout is reserved for the final group evaluation.
 
-**Data-source note:** Both the prospect-pool analysis and the modeling section reuse the same DuckDB-derived eligible constituent-year panel (`dev_panel`). Historical giving predictors are constructed from the giving aggregates, and the 23 solicitation predictors are joined from `Data_Files/solicitation_features.csv`. No separate constituent-fiscal-year analytic CSV is required. The campaign response measures are proxies, not causal estimates of solicitation effectiveness.
+**Data-source note:** Both the prospect-pool analysis and the modeling section reuse the same DuckDB-derived eligible constituent-year panel (`dev_panel`). Historical giving predictors are constructed from the giving aggregates, and the 23 solicitation predictors are joined from `Data_Files/solicitation_features.csv`. The campaign response measures are proxies, not causal estimates of solicitation effectiveness.
 
-## 1. Prospect Pool: Objective
 
-Compare constituents with **current recognized giving of $1–$1,199.99** against those with **$0 current recognized giving**, and report following-year major-donor conversions, recognized giving, and direct cash giving. A major-donor conversion means following-year recognized giving of at least $1,200. Dollar amounts are historical observations, not incremental revenue caused by modeling.
+## 1. Prospect Pool Exploratory Analysis
+
+**Question:** Are eligible constituents with any recognized giving in the current fiscal year more likely to convert to major donors in the following fiscal year than those with zero recognized giving?
+
+Compare constituents with **current recognized giving of $0.01–$1,199.99** against those with **$0 current recognized giving**, and report following-year major-donor conversions, recognized giving, and direct cash giving. A major-donor conversion means following-year recognized giving of at least $1,200. Dollar amounts are historical observations, not incremental revenue caused by modeling.
 
 This first stage is a descriptive analysis of four feature-year cohorts, **not** a model-validation analysis. Constituents may appear in multiple cohorts. FY2025-to-FY2026 is reserved for separate confirmation and is not included here.
 
-## 2. Prospect Pool: Data Preparation
+### Data Preparation
 
 ```{r}
 library(dplyr)
@@ -211,7 +214,7 @@ tibble(eligible_constituent_years = nrow(dev_panel),
   fmt_number(columns = everything(), decimals = 0)
 ```
 
-## 3. Prospect Pool: Historical Conversions and Giving
+### Historical Conversions and Giving
 
 Dollar amounts below are **following-year contributions from constituents who converted to major donors**, not giving from all constituents in the cohort.
 
@@ -377,19 +380,22 @@ giving_contribution_summary |>
   fmt_percent(columns = starts_with("share_"), decimals = 2)
 ```
 
-**Interpretation:** These are observed historical contributions associated with converted constituents who had no recognized giving in the preceding fiscal year. Excluding that population would remove them from the model's candidate pool, but does not establish that their donations would have been lost without the model. Recognized giving may include soft credits and is not interchangeable with cash receipts.
+### Prospect Pool Summary
+
+The exploratory analysis reveals substantial differences between the two prospect pools. Constituents with recognized giving in the feature fiscal year were considerably more likely to reach the $1,200 major-donor threshold in the following year. In contrast, constituents with no recognized giving had a much lower conversion rate but represented a substantially larger pool of potential prospects.
+
+Although the current-giving group demonstrated a higher likelihood of conversion, the zero-giving group still contributed new major donors, indicating that potential fundraising opportunities exist within both populations. These findings highlight a tradeoff between conversion likelihood and the size of the prospect pool, providing context for the modeling population decisions evaluated in Section 2.
 
 ```{r}
 # Close the connection after all queries and summaries have been created.
 dbDisconnect(con, shutdown = TRUE)
 ```
 
+## 2. Baseline Population Comparison
 
-## 4. Modeling Population and Analytic Data
+**Question:** Do the 4 baseline predictors perform better for all eligible prospects or for eligible prospects who gave more than $0 in the **current** fiscal year?
 
-The historical results motivate **including both current-giving and zero-current-giving eligible constituents**. The modeling stage uses all eligible development-year constituent records for validation; within each training fold, it retains all positives and samples negatives at up to 50 per positive to reduce computational cost. Therefore, "everyone" refers to the **eligible prospect population and validation pool**, not necessarily every negative observation used in fitting.
-
-The modeling stage reuses `dev_panel` constructed from the DuckDB source tables above. Historical giving predictors are computed from fiscal-year aggregates, and the 23 solicitation features are joined by constituent and fiscal year. No separate `constituent_fiscal_year_analytic.csv` is needed. FY2025 features and FY2026 outcomes remain reserved for the group's final evaluation.
+Both populations are compared with the same four group-model benchmark predictors using all three expanding-window validation folds. Each validation fold retains the actual population prevalence. Training retains all positives and samples up to 50 negatives per positive. The population decision considers both average precision and how many future conversions remain eligible.
 
 ```{r modeling_setup}
 library(caret)
@@ -427,71 +433,26 @@ giving_history <- dev_panel |>
     trailing_3_fy_giving = recognized_amount + prior_fy_giving + two_fy_prior_giving,
     giving_trend_vs_prior_fy = recognized_amount - prior_fy_giving,
     prior_giving_years = lag(cumsum(recognized_amount > 0), default = 0),
-    prior_max_fy_giving = lag(cummax(recognized_amount), default = 0)
+    prior_max_fy_giving = lag(cummax(recognized_amount), default = 0),
+    log_current_giving = log1p(recognized_amount),
+    log_peak_annual_giving = log1p(cummax(recognized_amount)),
+    active_giving_years = cumsum(recognized_amount > 0),
+    any_soft_credit_to_date = as.integer(cumsum(soft_amount) > 0)
   ) |>
   ungroup() |>
   filter(fiscal_year %in% feature_years) |>
   select(constituent_id, fiscal_year, prior_fy_giving, two_fy_prior_giving,
          trailing_3_fy_giving, giving_trend_vs_prior_fy,
-         prior_giving_years, prior_max_fy_giving)
+         prior_giving_years, prior_max_fy_giving,
+         log_current_giving, log_peak_annual_giving,
+         active_giving_years, any_soft_credit_to_date)
 
 dev <- dev_panel |>
   left_join(giving_history, by = c("constituent_id", "fiscal_year")) |>
   mutate(annual_giving = recognized_amount)
 ```
 
-### Solicitation Features
-
-Run the 23-feature solicitation engineering script once from the repository root (for example, `python Feature_Engineering.py`). That script creates `Data_Files/solicitation_features.csv` with 23 solicitation predictors, keyed by `constituent_id` and `fiscal_year`. This is a feature-only table, not a separate analytic panel.
-
-```{r join_solicitation_features}
-solicitation_path <- here::here("Data_Files", "solicitation_features.csv")
-if (!file.exists(solicitation_path)) {
-  stop("Missing solicitation feature table. Run the 23-feature Feature_Engineering.py script first")
-}
-
-solicitation_data <- readr::read_csv(solicitation_path, show_col_types = FALSE,
-                                    col_types = cols(constituent_id = col_character(), .default = col_guess()))
-
-solicitation_columns <- c(
-  "trailing_3_fy_solicitations", "campaign_response_rate", "solicitations_digital",
-  "prior_fy_solicitations", "solicitations", "trailing_3_fy_response_rate",
-  "solicitations_miscellaneous", "trailing_3_fy_campaign_responses", "unique_campaigns_solicited",
-  "campaign_codes_linked", "responses_miscellaneous", "solicitations_mail",
-  "solicitations_email", "prior_fy_campaign_responses", "campaign_responses",
-  "solicitations_phone", "solicitations_in_person", "responses_mail",
-  "responses_phone", "responses_email", "responses_digital",
-  "responses_in_person", "campaign_code_link_rate"
-)
-stopifnot(all(c("constituent_id", "fiscal_year", solicitation_columns) %in%
-              names(solicitation_data)))
-stopifnot(!anyDuplicated(solicitation_data[c("constituent_id", "fiscal_year")]))
-
-dev <- dev |>
-  mutate(constituent_id = as.character(constituent_id)) |>
-  left_join(
-    solicitation_data |>
-      select(constituent_id, fiscal_year, all_of(solicitation_columns)),
-    by = c("constituent_id", "fiscal_year"),
-    relationship = "many-to-one"
-  )
-
-# Zero exposures and response counts for constituents without campaign rows.
-count_features <- setdiff(solicitation_columns,
-                          c("campaign_response_rate", "trailing_3_fy_response_rate", "campaign_code_link_rate"))
-dev <- dev |>
-  mutate(across(all_of(count_features), ~coalesce(.x, 0)))
-
-stopifnot(nrow(dev) == nrow(dev_panel),
-          !anyDuplicated(dev[c("constituent_id", "fiscal_year")]),
-          all(dev$major_donor_next_fy %in% 0:1))
-```
-
-## 5. Solicitation Modeling: Temporal Validation
-
-Three expanding-window folds test whether models trained on earlier years can predict outcomes in a later year. The first trains on FY2021 features and validates on FY2022 features (FY2023 outcomes); the second trains on FY2021 and FY2022 features and validates on FY2023 features (FY2024 outcomes); the third trains on FY2021 through FY2023 features and validates on FY2024 features (FY2025 outcomes).
-
-Predictions are assumed to occur after the validation feature year has ended, when that year's giving and solicitation information is available. The outcome column already refers to giving in the following fiscal year, so no additional shift is needed. All three folds are used to compare models; the FY2025-feature/FY2026-outcome holdout is not used here.
+### Temporal Validation
 
 ```{r folds}
 folds <- tibble(
@@ -504,35 +465,23 @@ folds <- tibble(
 gt(folds)
 ```
 
-### Predictor Sets
 
-To evaluate the incremental predictive value of solicitation-response information, each model is fitted with two predictor sets on the same eligible constituent-years. The baseline uses giving-history predictors constructed from the DuckDB data, while the expanded set adds 23 solicitation-related predictors covering solicitation counts, response measures, campaign activity, and historical rates. Predictors are explicitly selected from 10 giving-related variables and 23 solicitation-related variables. Identification fields, future-year outcomes, snapshots, and cultivation fields are excluded. The comparison therefore tests whether adding solicitation-related variables improves predictions beyond the baseline predictors.
+### Baseline Predictors
+
+These are the same four predictors used in the group model’s provisional benchmark (Configuration A). Giving history is calculated from the available fiscal-year records. If the group model includes earlier legacy giving in its cumulative measures, the values may not match exactly until that history is incorporated here.
 
 ```{r predictors}
 # Explicitly whitelist predictors available at the end of the feature year.
 # Do not include next-year giving, outcome, eligibility, or identification fields.
 baseline_features <- c(
-  "annual_giving", "direct_amount", "soft_amount", "current_donor",
-  "prior_fy_giving", "two_fy_prior_giving", "trailing_3_fy_giving",
-  "giving_trend_vs_prior_fy", "prior_giving_years", "prior_max_fy_giving"
+  "log_current_giving", "log_peak_annual_giving",
+  "active_giving_years", "any_soft_credit_to_date"
 )
-stopifnot(all(c(baseline_features, solicitation_columns) %in% names(dev)))
+stopifnot(all(baseline_features %in% names(dev)))
 
-feature_sets <- list(
-  without_solicitation = baseline_features,
-  with_solicitation = c(baseline_features, solicitation_columns)
-)
-solicitation <- solicitation_columns
-
-gt(tibble(feature_set = names(feature_sets), predictors = lengths(feature_sets)))
 ```
 
-
-### Training Preparation
-
-Major-donor conversions are uncommon, so each training fold retains every positive case and randomly samples up to 50 negative cases per positive case to reduce computation. Validation uses every eligible observation, preserving the actual outcome frequency. Missing predictor values are replaced with medians calculated from the sampled training data, and predictors that are constant in that sample are removed. These preprocessing decisions are then applied to the validation data.
-
-Because negative sampling changes the proportion of positive cases used for fitting, predicted probabilities are adjusted using the difference between sampled and original training prevalence. This correction preserves the ranking of predictions but does not guarantee well-calibrated probabilities, particularly for ensemble models.
+### Shared Training Preparation
 
 ```{r training_prep}
 prepare_features <- function(columns, train_data, valid_data, sampled_rows) {
@@ -579,11 +528,8 @@ correct_probability <- function(probability, population_prior, sample_prior) {
 ```
 
 
-## 6. Solicitation Modeling: Training
 
-Four classification algorithms are compared: Logistic Regression as a conventional benchmark, Elastic Net as a regularized logistic regression model, Random Forest as a bagged tree ensemble, and XGBoost as a gradient-boosted tree ensemble. Each algorithm is fitted separately for both predictor sets across three chronological validation folds, producing 24 model fits in total.
-
-Hyperparameters are fixed rather than optimized through an additional tuning procedure. Elastic Net uses centered and scaled predictors, while the other models use the imputed predictors directly. Each fitted model generates predicted probabilities for the full validation population, which are adjusted for the altered training class proportions before evaluation.
+### Four-Model Training Function (Used in Section 3)
 
 ```{r models}
 # Fixed model settings for benchmark comparisons
@@ -689,89 +635,8 @@ fit_models <- function(x_train, x_valid, y_train) {
 }
 ```
 
-```{r predictions}
-predictions <- bind_rows(lapply(seq_len(nrow(folds)), function(fold) {
 
-  # Select training and validation years
-  train_data <- dev %>%
-    filter(fiscal_year < folds$feature_year[fold])
-
-  valid_data <- dev %>%
-    filter(fiscal_year == folds$feature_year[fold])
-
-  # Identify positive and negative training observations
-  y_full <- train_data$major_donor_next_fy
-
-  positive <- which(y_full == 1)
-  negative <- which(y_full == 0)
-
-  # Keep every positive and sample up to 50 negatives per positive
-  set.seed(RANDOM_SEED + fold)
-
-  sampled_rows <- sort(c(
-    positive,
-    sample(
-      negative,
-      min(length(negative), 50L * length(positive))
-    )
-  ))
-
-  # Create training outcome
-  y_train <- factor(
-    ifelse(y_full[sampled_rows] == 1, "yes", "no"),
-    levels = c("yes", "no")
-  )
-
-  # Verify both outcome classes are represented
-  stopifnot(all(table(y_train) > 0))
-
-  # Calculate class proportions for probability correction
-  population_prior <- mean(y_full == 1)
-  sample_prior <- mean(y_full[sampled_rows] == 1)
-
-  # Compare models with and without solicitation features
-  bind_rows(lapply(names(feature_sets), function(feature_set) {
-
-    features <- prepare_features(
-      feature_sets[[feature_set]],
-      train_data,
-      valid_data,
-      sampled_rows
-    )
-
-    # Fit four models and predict validation outcomes
-    scores <- fit_models(
-      features$train,
-      features$valid,
-      y_train
-    )
-
-    # Store predictions for each model
-    bind_rows(lapply(names(scores), function(model) {
-
-      corrected <- correct_probability(
-        scores[[model]],
-        population_prior,
-        sample_prior
-      )
-
-      tibble(
-        fold = fold,
-        feature_year = folds$feature_year[fold],
-        outcome_year = folds$outcome_year[fold],
-        model = model,
-        feature_set = feature_set,
-        outcome = valid_data$major_donor_next_fy,
-        probability = corrected
-      )
-    }))
-  }))
-}))
-```
-
-## 7. Solicitation Modeling: Evaluation
-
-Each model's predictions are evaluated against observed next-year major-donor conversions using average precision, ROC AUC, and Brier score. **Average precision** is the primary selection metric because it measures how effectively a model ranks rare positive cases. ROC AUC measures discrimination between positive and negative cases, while the Brier score measures squared probability error (lower is better).
+### Shared Evaluation Metrics
 
 ```{r evaluation}
 score_model <- function(data) {
@@ -850,15 +715,355 @@ score_model <- function(data) {
     } else NA_real_
   )
 }
+```
 
-# Evaluate each model within each validation fold
-comparison <- predictions %>%
-  group_by(fold, feature_year, outcome_year, model, feature_set) %>%
-  group_modify(~ score_model(.x)) %>%
+### Logistic Regression: Baseline Population Comparison
+
+```{r baseline_population_predictions}
+# Section 2 is deliberately a simple logistic-regression-only population test.
+# The four-model comparison is reserved for Section 3.
+populations <- c("all_eligible", "positive_current_givers")
+
+baseline_predictions <- dplyr::bind_rows(lapply(seq_len(nrow(folds)), function(fold) {
+  train_all <- dev |> filter(fiscal_year < folds$feature_year[fold])
+  valid_all <- dev |> filter(fiscal_year == folds$feature_year[fold])
+
+  dplyr::bind_rows(lapply(populations, function(population) {
+    train_data <- train_all
+    valid_data <- valid_all
+    if (population == "positive_current_givers") {
+      train_data <- train_data |> filter(annual_giving > 0)
+      valid_data <- valid_data |> filter(annual_giving > 0)
+    }
+
+    y_full <- as.integer(train_data$major_donor_next_fy)
+    positive <- which(y_full == 1L)
+    negative <- which(y_full == 0L)
+    if (!length(positive) || !length(negative) || !nrow(valid_data)) {
+      stop("Insufficient training classes or validation observations in fold ",
+           fold, " for ", population)
+    }
+
+    # Keep all positives and sample at most 50 negatives per positive.
+    set.seed(RANDOM_SEED + fold +
+             ifelse(population == "positive_current_givers", 1000L, 0L))
+    sampled_rows <- sort(c(
+      positive,
+      sample(negative, min(length(negative), 50L * length(positive)))
+    ))
+
+    features <- prepare_features(
+      baseline_features, train_data, valid_data, sampled_rows
+    )
+    if (ncol(features$train) == 0L) {
+      stop("No varying baseline predictors in fold ", fold, " for ", population)
+    }
+
+    # Remove linearly dependent columns to reduce singular-fit problems.
+    design <- cbind(Intercept = 1, as.matrix(features$train))
+    qr_design <- qr(design)
+    independent <- colnames(design)[qr_design$pivot[seq_len(qr_design$rank)]]
+    glm_columns <- setdiff(independent, "Intercept")
+
+    x_train <- as.data.frame(features$train[, glm_columns, drop = FALSE])
+    x_valid <- as.data.frame(features$valid[, glm_columns, drop = FALSE])
+    x_train$outcome <- y_full[sampled_rows]
+
+    logistic_model <- stats::glm(
+      outcome ~ ., data = x_train, family = stats::binomial()
+    )
+    raw_probability <- as.numeric(stats::predict(
+      logistic_model, newdata = x_valid, type = "response"
+    ))
+
+    population_prior <- mean(y_full == 1L)
+    sample_prior <- mean(y_full[sampled_rows] == 1L)
+
+    tibble(
+      fold = fold,
+      feature_year = folds$feature_year[fold],
+      outcome_year = folds$outcome_year[fold],
+      population = population,
+      model = "Logistic Regression",
+      outcome = as.integer(valid_data$major_donor_next_fy),
+      probability = correct_probability(
+        raw_probability, population_prior, sample_prior
+      )
+    )
+  }))
+}))
+
+baseline_results <- baseline_predictions |>
+  group_by(fold, feature_year, outcome_year, population, model) |>
+  group_modify(~ score_model(.x)) |>
+  ungroup()
+
+baseline_summary <- baseline_results |>
+  group_by(population, model) |>
+  summarise(
+    mean_ap = mean(average_precision, na.rm = TRUE),
+    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
+    mean_brier = mean(brier, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(mean_ap))
+
+# Like-for-like comparison: both populations evaluated on all three folds.
+baseline_shared_folds <- baseline_results |>
+  group_by(population, model) |>
+  summarise(
+    validation_folds = n(),
+    mean_ap = mean(average_precision, na.rm = TRUE),
+    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
+    mean_brier = mean(brier, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(mean_ap))
+
+baseline_shared_folds |>
+  gt() |>
+  tab_header(title = "Population Comparison: All Three Shared Folds") |>
+  fmt_number(columns = c(mean_ap, mean_roc_auc), decimals = 4) |>
+  fmt_number(columns = mean_brier, decimals = 6)
+
+# Overall summary using the same three folds per population.
+baseline_summary |>
+  gt() |>
+  tab_header(title = "Logistic Regression: Prospect Population Comparison") |>
+  fmt_number(columns = c(mean_ap, mean_roc_auc), decimals = 4) |>
+  fmt_number(columns = mean_brier, decimals = 6)
+```
+
+### Prospect Coverage
+
+A restricted population can have higher average precision while excluding future major donors. The following counts are unique within each feature-year cohort, not unique across all years.
+
+```{r baseline_coverage}
+baseline_coverage <- dev |>
+  group_by(fiscal_year) |>
+  summarise(
+    eligible = n(),
+    eligible_positive_current_givers = sum(annual_giving > 0),
+    total_conversions = sum(major_donor_next_fy),
+    conversions_positive_current_givers = sum(major_donor_next_fy[annual_giving > 0]),
+    .groups = "drop"
+  ) |>
+  mutate(
+    prospect_coverage = eligible_positive_current_givers / eligible,
+    conversion_coverage = if_else(total_conversions > 0,
+                                  conversions_positive_current_givers / total_conversions, NA_real_)
+  )
+
+baseline_coverage |>
+  gt() |>
+  tab_header(title = "Coverage of Positive Current-Year Giving Restriction") |>
+  fmt_number(columns = c(eligible, eligible_positive_current_givers,
+                         total_conversions, conversions_positive_current_givers), decimals = 0) |>
+  fmt_percent(columns = c(prospect_coverage, conversion_coverage), decimals = 2)
+```
+
+### Prospect Pool Selection
+
+```{r}
+selected_population <- "positive_current_givers"
+stopifnot(selected_population %in% populations)
+
+selected_data <- if (selected_population == "positive_current_givers") {
+  dev |> filter(annual_giving > 0)
+} else {
+  dev
+}
+
+tibble(
+  selected_population = selected_population,
+  observations = nrow(selected_data),
+  unique_constituents = n_distinct(selected_data$constituent_id),
+  conversions = sum(selected_data$major_donor_next_fy),
+  conversion_rate = mean(selected_data$major_donor_next_fy)
+  ) |>
+  gt() |>
+  fmt_number(
+    columns = c(observations, unique_constituents, conversions),
+    decimals = 0
+  ) |>
+  fmt_percent(columns = conversion_rate, decimals = 3)
+```
+
+To determine the appropriate prospect population for predictive modeling, I compared two logistic regression models using the same modeling approach: one restricted to constituents with positive current-year giving and another including all eligible constituents, regardless of current-year giving activity.
+
+The positive-current-givers model outperformed the all-eligible model across all three evaluation metrics. Average precision increased from 0.1017 to 0.1721, representing a **69.2% relative improvement**. ROC AUC increased slightly from 0.9193 to 0.9224, while the mean Brier score decreased from 0.013476 to 0.001269.
+
+Although these results favor the positive-current-givers model, average precision is influenced by the underlying conversion rate, which differs between the two prospect populations. Therefore, the comparison must also consider the proportion of future major-donor conversions retained. As demonstrated in the exploratory analysis, restricting the population to constituents with positive current-year giving reduces the eligible prospect pool by approximately 79.2% while retaining 91.3% of historically observed conversions.
+
+Based on these findings, I selected constituents with positive current-year giving below $1,200 as the prospect population for subsequent modeling. This approach prioritizes a smaller pool of constituents with a higher observed likelihood of becoming major donors, while acknowledging that some potential conversions may be excluded.
+
+## 3. Solicitation Feature Comparison
+
+**Question:** Within the population selected in Section 2, do the 23 solicitation features improve performance beyond the four group-model benchmark predictors?
+
+The two predictor sets are trained and validated on identical selected-population observations and temporal folds. Campaign response indicators are observational proxies, not causal evidence of outreach effectiveness.
+
+### Solicitation Features
+
+**Instructions**: Run the 23-feature solicitation engineering script once from the repository root (for example, `python Feature_Engineering.py`). That script creates `Data_Files/solicitation_features.csv` with 23 solicitation predictors, keyed by `constituent_id` and `fiscal_year`. This is a feature-only table, not a separate analytic panel.
+
+```{r join_solicitation_features}
+solicitation_path <- here::here("Data_Files", "solicitation_features.csv")
+if (!file.exists(solicitation_path)) {
+  stop("Missing solicitation feature table. Run the 23-feature Feature_Engineering.py script first")
+}
+
+solicitation_data <- readr::read_csv(solicitation_path, show_col_types = FALSE,
+                                    col_types = cols(constituent_id = col_character(), .default = col_guess()))
+
+solicitation_columns <- c(
+  "trailing_3_fy_solicitations", "campaign_response_rate", "solicitations_digital",
+  "prior_fy_solicitations", "solicitations", "trailing_3_fy_response_rate",
+  "solicitations_miscellaneous", "trailing_3_fy_campaign_responses", "unique_campaigns_solicited",
+  "campaign_codes_linked", "responses_miscellaneous", "solicitations_mail",
+  "solicitations_email", "prior_fy_campaign_responses", "campaign_responses",
+  "solicitations_phone", "solicitations_in_person", "responses_mail",
+  "responses_phone", "responses_email", "responses_digital",
+  "responses_in_person", "campaign_code_link_rate"
+)
+stopifnot(all(c("constituent_id", "fiscal_year", solicitation_columns) %in%
+              names(solicitation_data)))
+stopifnot(!anyDuplicated(solicitation_data[c("constituent_id", "fiscal_year")]))
+
+dev <- dev |>
+  mutate(constituent_id = as.character(constituent_id)) |>
+  left_join(
+    solicitation_data |>
+      select(constituent_id, fiscal_year, all_of(solicitation_columns)),
+    by = c("constituent_id", "fiscal_year"),
+    relationship = "many-to-one"
+  )
+
+# Zero exposures and response counts for constituents without campaign rows.
+count_features <- setdiff(solicitation_columns,
+                          c("campaign_response_rate", "trailing_3_fy_response_rate", "campaign_code_link_rate"))
+dev <- dev |>
+  mutate(across(all_of(count_features), ~coalesce(.x, 0)))
+
+stopifnot(nrow(dev) == nrow(dev_panel),
+          !anyDuplicated(dev[c("constituent_id", "fiscal_year")]),
+          all(dev$major_donor_next_fy %in% 0:1))
+```
+
+
+```{r solicitation_feature_sets}
+stopifnot(length(solicitation_columns) == 23L)
+feature_sets <- list(
+  without_solicitation = baseline_features,
+  with_solicitation = c(baseline_features, solicitation_columns)
+)
+solicitation <- solicitation_columns
+
+gt(tibble(feature_set = names(feature_sets), predictors = lengths(feature_sets)))
+```
+
+### Model Training
+
+```{r selected_modeling_data}
+# Reapply the Section 2 population decision after joining solicitation predictors.
+modeling_data <- if (selected_population == "positive_current_givers") {
+  dev |> filter(annual_giving > 0)
+} else {
+  dev
+}
+stopifnot(all(c(baseline_features, solicitation_columns) %in% names(modeling_data)))
+```
+
+```{r predictions}
+predictions <- bind_rows(lapply(seq_len(nrow(folds)), function(fold) {
+
+  # Select training and validation years
+  train_data <- modeling_data %>%
+    filter(fiscal_year < folds$feature_year[fold])
+
+  valid_data <- modeling_data %>%
+    filter(fiscal_year == folds$feature_year[fold])
+
+  # Identify positive and negative training observations
+  y_full <- train_data$major_donor_next_fy
+
+  positive <- which(y_full == 1)
+  negative <- which(y_full == 0)
+
+  # Keep every positive and sample up to 50 negatives per positive
+  set.seed(RANDOM_SEED + fold)
+
+  sampled_rows <- sort(c(
+    positive,
+    sample(
+      negative,
+      min(length(negative), 50L * length(positive))
+    )
+  ))
+
+  # Create training outcome
+  y_train <- factor(
+    ifelse(y_full[sampled_rows] == 1, "yes", "no"),
+    levels = c("yes", "no")
+  )
+
+  # Verify both outcome classes are represented
+  stopifnot(all(table(y_train) > 0))
+
+  # Calculate class proportions for probability correction
+  population_prior <- mean(y_full == 1)
+  sample_prior <- mean(y_full[sampled_rows] == 1)
+
+  # Compare models with and without solicitation features
+  bind_rows(lapply(names(feature_sets), function(feature_set) {
+
+    features <- prepare_features(
+      feature_sets[[feature_set]],
+      train_data,
+      valid_data,
+      sampled_rows
+    )
+
+    # Fit four models and predict validation outcomes
+    scores <- fit_models(
+      features$train,
+      features$valid,
+      y_train
+    )
+
+    # Store predictions for each model
+    bind_rows(lapply(seq_along(scores), function(i) {
+
+      model_name <- names(scores)[i]
+      corrected <- correct_probability(
+        scores[[i]],
+        population_prior,
+        sample_prior
+      )
+
+      tibble(
+        fold = fold,
+        feature_year = folds$feature_year[fold],
+        outcome_year = folds$outcome_year[fold],
+        model = model_name,
+        feature_set = feature_set,
+        outcome = valid_data$major_donor_next_fy,
+        probability = corrected
+      )
+    }))
+  }))
+}))
+```
+
+
+```{r solicitation_evaluation}
+comparison <- predictions |>
+  group_by(fold, feature_year, outcome_year, model, feature_set) |>
+  group_modify(~ score_model(.x)) |>
   ungroup()
 ```
 
-Performance is compared across eight model configurations: four algorithms, each evaluated with and without solicitation-response predictors. Each metric is averaged equally across the three chronological validation folds, and configurations are ranked by mean average precision. Because validation years contain different numbers of conversions, these unweighted fold averages describe typical yearly performance rather than pooled performance across all observations.
+### Performance Comparison
 
 ```{r model-comparison}
 # Summarize performance across validation folds
@@ -884,8 +1089,6 @@ model_summary %>%
     decimals = 6
   )
 ```
-
-The table above reports the results for the predictors built in this document. Compare the with- and without-solicitation configurations using mean average precision as the primary metric. Earlier results from a different feature-engineering pipeline are not assumed to reproduce here.
 
 ### Highlight: Best-Performing Models
 
@@ -919,19 +1122,11 @@ best_models %>%
   fmt_number(columns = value, decimals = 4)
 ```
 
-Use the computed `best_models` table above to identify the leading configuration for each metric. Select the development-stage model by mean average precision, while checking ROC AUC and Brier score for context.
-
-## 8. Solicitation Feature Importance
-
-To examine the solicitation predictors in XGBoost, it is used to examine which solicitation-related features contribute most to prediction. An additional XGBoost model is fitted using all FY2021–FY2024 development data, with the same preprocessing, negative sampling strategy, and hyperparameters as the validation models.
-
-Feature importance is measured using **gain**, which represents the relative improvement in XGBoost's training objective associated with splits using each predictor. The first plot displays feature importance across all predictors, while the second focuses specifically on solicitation-related predictors. Both plots use gain values from the same fitted model, allowing their relative contributions to be compared directly.
-
-These importance measures help identify solicitation-related features for consideration in the group's combined prediction model, but do not establish their independent predictive value or guarantee their usefulness alongside additional predictors.
+### Feature Importance
 
 ```{r variable-importance}
 # Identify positive and negative development observations
-y_full <- dev$major_donor_next_fy
+y_full <- modeling_data$major_donor_next_fy
 
 positive <- which(y_full == 1)
 negative <- which(y_full == 0)
@@ -950,83 +1145,88 @@ sampled_rows <- sort(c(
 # Prepare predictors using the full development period
 features <- prepare_features(
   feature_sets$with_solicitation,
-  dev,
-  dev,
+  modeling_data,
+  modeling_data,
   sampled_rows
 )
 
-# Fit XGBoost using the same hyperparameters
+# Convert predictors to matrices
+x_train <- as.matrix(features$train)
+y_train <- as.integer(y_full[sampled_rows])
+
+# Fit Elastic Net with cross-validation to select lambda
 set.seed(RANDOM_SEED)
 
-boost <- xgboost::xgb.train(
-  data = xgboost::xgb.DMatrix(
-    as.matrix(features$train),
-    label = as.integer(y_full[sampled_rows])
-  ),
-  params = list(
-    objective = "binary:logistic",
-    max_depth = 3,
-    eta = 0.05,
-    colsample_bytree = 0.8,
-    subsample = 0.8,
-    nthread = 1
-  ),
-  nrounds = 100,
-  verbose = 0
+elastic_net <- glmnet::cv.glmnet(
+  x = x_train,
+  y = y_train,
+  family = "binomial",
+  alpha = 0.5,
+  nfolds = 5,
+  type.measure = "deviance",
+  standardize = TRUE
 )
 ```
 
 ```{r}
-# Calculate feature importance for all predictors
-importance <- xgboost::xgb.importance(
-  model = boost
-)
+# Extract Elastic Net coefficients
+importance <- as.matrix(
+  coef(elastic_net, s = "lambda.min")
+) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("Feature") |>
+  rename(Coefficient = 2) |>
+  filter(Feature != "(Intercept)") |>
+  mutate(
+    Importance = abs(Coefficient),
+    Direction = if_else(
+      Coefficient > 0,
+      "Positive",
+      "Negative"
+    )
+  ) |>
+  arrange(desc(Importance))
 
-# Plot importance for all features
+# Plot feature importance for all predictors
 ggplot(
   importance,
-  aes(x = reorder(Feature, Gain), y = Gain)
+  aes(
+    x = reorder(Feature, Importance),
+    y = Importance,
+    fill = Direction
+  )
 ) +
-  geom_col(fill = "steelblue") +
+  geom_col() +
   coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "Positive" = "#108542",
+      "Negative" = "#D9534F"
+    )
+  ) +
   labs(
-    title = "XGBoost Feature Importance: All Features",
+    title = "Elastic Net Feature Importance: All Features",
     x = NULL,
-    y = "Gain"
+    y = "Absolute Coefficient",
+    fill = "Association"
   ) +
   theme_minimal()
 ```
 
-Interpret the plot above using the newly fitted model. Gain measures relative split contribution and does not establish causation.
+The strongest features that have a positive association with major donor conversion are `any_soft_credit_to_date`, `log_current_giving`, `log_peak_annual_giving`, `solicitations_phone`, `trailing_3_fy_response_rate`, `campaign_responses`, and `solicitations_email`.
 
-```{r}
-# Identify solicitation-related features
-solicitation_importance <- importance %>%
-  filter(Feature %in% solicitation) %>%
-  arrange(desc(Gain))
+The strongest features that have a negative association with major donor conversion are `responses_miscellaneous`, `responses_email`, `responses_digital`, `solicitations_in_person`, `active_giving_years`, `prior_fy_campaign_responses`, `trailing_3_fy_campaign_responses`, `prior_fy_solicitations`, `solicitations_mail`, and `solicitations_miscellaneous`.
 
-# Plot importance for solicitation features
-ggplot(
-  solicitation_importance,
-  aes(x = reorder(Feature, Gain), y = Gain)
-) +
-  geom_col(fill = "steelblue") +
-  coord_flip() +
-  labs(
-    title = "XGBoost Feature Importance: Solicitation Features",
-    x = NULL,
-    y = "Gain"
-  ) +
-  theme_minimal()
+The remaining features had coefficients near zero, suggesting that they contributed relatively little to the model's predictions after accounting for the other variables. This may reflect limited independent predictive information or overlap with other features included in the model.
 
-```
+### Conclusions
 
-The solicitation-only plot identifies which solicitation predictors the newly fitted XGBoost model uses most. Correlated predictors can share importance, and gain does not measure the causal effect of solicitation. The held-out comparison remains the primary evidence of incremental predictive value.
+This analysis evaluated the appropriate prospect population and the predictive value of solicitation-related features for identifying constituents likely to become major donors in the following fi+scal year.
 
-## 9. Conclusions
+The prospect pool analysis demonstrated that constituents with positive current-year giving were substantially more likely to reach the $1,200 major-donor threshold than constituents with no recognized giving. Although restricting the population excludes some potential conversions, it substantially reduces the number of eligible prospects while retaining the majority of historically observed conversions. Based on these findings and the initial logistic regression comparison, I selected constituents with recognized giving greater than $0 but less than $1,200 in the feature fiscal year as the population for subsequent modeling.
 
-The prospect-pool analysis compares the observed following-year conversion rates for eligible current-giving and zero-current-giving constituents. Both groups are retained for the modeling comparison.
+I then evaluated whether adding 23 solicitation-related features to the four baseline predictors improved model performance. Among the models evaluated, Elastic Net with the baseline and solicitation features achieved the strongest predictive performance. The feature importance analysis also identified several meaningful associations with major-donor conversion, including prior giving activity, soft-credit history, and solicitation engagement. These findings suggest that solicitation-related information provides additional predictive value beyond the baseline giving characteristics.
 
-The temporal validation results above determine whether the 23 solicitation predictors improve average precision relative to the same model trained only on giving-history features. Because the predictor definitions and population differ from the earlier standalone modeling pipeline, previously reported performance values should not be copied into this report without rerunning and verifying them.
+The next step is to integrate the solicitation features with the additional feature sets developed by the rest of the project team in a combined Group Modeling document. The combined models will then be evaluated using FY2025 predictor data and observed FY2026 conversion outcomes, which have been reserved for final validation. This evaluation will help determine whether the improvements observed during model development generalize to previously unseen data and identify the most effective model for predicting future major-donor conversions.
 
-Solicitation-response features describe historical associations and should not be interpreted as causal effects of outreach on giving.
+Ultimately, the objective is to provide PBS Utah with a reliable, data-driven approach to identifying promising major-donor prospects and prioritizing fundraising outreach.
