@@ -1,6 +1,8 @@
 ---
 title: "Individual Major-Donor Modeling: Prospect Selection and Solicitation Features"
 subtitle: "Historical prospect-pool opportunity followed by expanding-window predictive modeling"
+author: "Owen Simon"
+date: today
 format:
   html:
     toc: true
@@ -25,6 +27,8 @@ Compare constituents with **current recognized giving of $0.01–$1,199.99** aga
 This first stage is a descriptive analysis of four feature-year cohorts, **not** a model-validation analysis. Constituents may appear in multiple cohorts. FY2025-to-FY2026 is reserved for separate confirmation and is not included here.
 
 ### Data Preparation
+
+Load the required R packages and PBS Utah data sources, including constituent records, payments, soft credits, campaign activity, Passport viewing, and legacy gifts. Establish the $1,200 major-donor threshold and define FY2021–FY2024 as feature years, with FY2022–FY2025 serving as their corresponding outcome years. DuckDB is used to process the source files, and fiscal years are defined as July through June.
 
 ```{r}
 library(dplyr)
@@ -62,9 +66,9 @@ load_csv("passport_raw", "passport_viewing.txt", "constituent_id, fiscal_year")
 load_csv("legacy_raw", "team_approach_legacy_payments.csv", paste(c("gift_date", "payment_amount", paste0("constituent_id_", 1:7)), collapse = ", "))
 ```
 
-### Individual Eligibility
+#### Individual Eligibility
 
-Exclude organizations and unmatched/orphan IDs as in the original development dataset. Spouse grouping is unnecessary because no model split is performed.
+Restrict the analysis to individual constituents by excluding organizations, missing constituent IDs, and unmatched or orphan records. This maintains consistency with the original modeling population while ensuring that each constituent is identified by a unique ID.
 
 ```{r}
 run_sql(r"---(
@@ -78,9 +82,9 @@ WHERE COALESCE("Constituent ID", '') NOT IN ('', 'SYN-ORPHAN')
 
 ```
 
-### Fiscal-Year Giving Aggregation
+#### Fiscal-Year Giving Aggregation
 
-Direct payments include deduplicated paid positive payments; soft credits include deduplicated positive credits. Recognized giving is the sum of direct payments and soft credits. Legacy gifts establish historical existence only and do not contribute to these giving totals.
+Deduplicate payment and soft credit records, then aggregate positive, paid direct contributions and positive soft credits by constituent and fiscal year. Recognized giving is defined as the sum of direct giving and soft credits. Legacy gift records are processed separately to establish historical activity but are excluded from the giving totals.
 
 ```{r}
 run_sql("CREATE OR REPLACE TEMP TABLE payments_dedup AS SELECT DISTINCT * FROM payments_raw")
@@ -122,9 +126,9 @@ run_sql(paste("CREATE OR REPLACE TEMP TABLE legacy_links AS", legacy_union))
 ```
 
 
-### Historical Existence
+#### Historical Existence
 
-A constituent enters a feature-year cohort only if activity was recorded by that year. Activity may be from payments, soft credits, campaigns, Passport, or legacy gifts. This reproduces the original historical existence rule, including its limitation that an existing person with no prior recorded activity is not counted.
+Determine the earliest fiscal year in which each constituent had recorded activity across payments, soft credits, campaigns, Passport viewing, or legacy gifts. Constituents are included in a fiscal-year cohort only if their first recorded activity occurred during or before that year. This prevents constituents from entering the analysis before their earliest documented activity.
 
 ```{r}
 existence_sources <- q(r"---(
@@ -155,7 +159,9 @@ existence <- existence_sources |>
 
 ```
 
-### Eligible Constituent-Year Panel
+#### Eligible Constituent-Year Panel
+
+Construct the development dataset by combining historical eligibility, current-year giving, and following-year giving for FY2021–FY2024 feature cohorts. Include constituents with recognized giving below $1,200 in the feature year and classify them as either Current Giving ($0.01–$1,199.99) or No Current Giving ($0). A major-donor conversion occurs when a constituent reaches at least $1,200 in recognized giving in the following fiscal year. The resulting dataset is validated for duplicate constituent-year records, fiscal-year alignment, and eligibility requirements.
 
 ```{r}
 direct_fy <- q("SELECT constituent_id, fiscal_year, direct_amount FROM direct_fy")
@@ -212,6 +218,99 @@ tibble(eligible_constituent_years = nrow(dev_panel),
   cols_label(eligible_constituent_years = "Eligible constituent-years",
              major_donor_conversions = "Major-donor conversions") |>
   fmt_number(columns = everything(), decimals = 0)
+```
+
+### Historical Giving Inactivity
+
+```{r}
+# Establish the FY2025 eligible constituent population
+fy2025_population <- existence |>
+  filter(!is.na(first_activity_fy), first_activity_fy <= 2025) |>
+  distinct(constituent_id)
+
+# Calculate giving over both periods
+giving_inactivity <- fy2025_population |>
+  left_join(
+    giving_year |>
+      filter(fiscal_year >= 2021, fiscal_year <= 2025) |>
+      group_by(constituent_id) |>
+      summarise(
+        direct_1yr = sum(direct_amount[fiscal_year == 2025], na.rm = TRUE),
+        soft_1yr = sum(soft_amount[fiscal_year == 2025], na.rm = TRUE),
+        recognized_1yr = sum(recognized_amount[fiscal_year == 2025], na.rm = TRUE),
+
+        direct_5yr = sum(direct_amount, na.rm = TRUE),
+        soft_5yr = sum(soft_amount, na.rm = TRUE),
+        recognized_5yr = sum(recognized_amount, na.rm = TRUE),
+
+        .groups = "drop"
+      ),
+    by = "constituent_id"
+  ) |>
+  mutate(
+    across(
+      c(direct_1yr, soft_1yr, recognized_1yr,
+        direct_5yr, soft_5yr, recognized_5yr),
+      ~coalesce(.x, 0)
+    )
+  )
+
+# Summarize unique constituents with no giving
+inactivity_summary <- tibble(
+  period = c("FY2025 (1 Year)", "FY2021–FY2025 (5 Years)"),
+  total_unique_constituents = n_distinct(fy2025_population$constituent_id),
+
+  no_direct_giving = c(
+    sum(giving_inactivity$direct_1yr == 0),
+    sum(giving_inactivity$direct_5yr == 0)
+  ),
+
+  no_soft_credits = c(
+    sum(giving_inactivity$soft_1yr == 0),
+    sum(giving_inactivity$soft_5yr == 0)
+  ),
+
+  no_recognized_giving = c(
+    sum(giving_inactivity$recognized_1yr == 0),
+    sum(giving_inactivity$recognized_5yr == 0)
+  )
+) |>
+  mutate(
+    share_no_recognized = no_recognized_giving /
+      total_unique_constituents
+  )
+
+# Display summary table
+inactivity_summary |>
+  gt() |>
+  tab_header(
+    title = "Historical Giving Inactivity",
+    subtitle = "FY2025 eligible constituent population"
+  ) |>
+  cols_label(
+    period = "Giving period",
+    total_unique_constituents = "Total unique constituents",
+    no_direct_giving = "No direct giving",
+    no_soft_credits = "No soft credits",
+    no_recognized_giving = "No recognized giving",
+    share_no_recognized = "Share with no recognized giving"
+  ) |>
+  fmt_number(
+    columns = c(
+      total_unique_constituents,
+      no_direct_giving,
+      no_soft_credits,
+      no_recognized_giving
+    ),
+    decimals = 0
+  ) |>
+  fmt_percent(
+    columns = share_no_recognized,
+    decimals = 2
+  ) |>
+  tab_source_note(
+    "Recognized giving equals direct giving plus soft credits. Both periods use the same FY2025 eligible population."
+  )
 ```
 
 ### Historical Conversions and Giving

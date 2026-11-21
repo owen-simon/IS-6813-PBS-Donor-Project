@@ -1,0 +1,1438 @@
+---
+title: "Group Modeling: Identifying Constituents Likely to Reach $1,200 in Annual Giving"
+subtitle: "Group report: shared panel, development comparison, and a fixed FY2025 confirmation"
+author:
+  - "Abdullah Khan"
+  - "Owen Simon"
+  - "Clahan Tran"
+  - "Tama Wihongin"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## Notebook Status
+
+This is the group’s combined modeling report. It states the problem, records who contributed what, lists the decisions the group still has to make, records **working specifications** (not group-approved), builds and verifies the shared development dataset (feature years FY2021 to FY2024, outcomes FY2022 to FY2025), compares feature configurations and algorithms on development folds, and then runs one **fixed confirmation** on feature year FY2025 (outcome year FY2026) under a plan written before that period was scored.
+
+FY2025 was already examined in Clahan Tran’s individual analysis, so it is a **previously exposed historical confirmation period, not an independent untouched test**, and no model choice was changed after seeing it. The report does **not** copy the individual notebooks; they are source material to be synthesized, not stitched together.
+
+**Credit**. This notebook is a group synthesis of four individual contributions: Abdullah Khan (giving-history features), Owen Simon (prospect pool and solicitation-response features), Clahan Tran (Passport-engagement features, plus the dataset-construction code and verification counts that supply this notebook’s starting population), and Tama Wihongi (the decision-tree comparison). It is not solely any one person’s analysis. Each contribution stays valuable whether or not its features or algorithm improve prediction: a feature block that adds nothing measurable still answers a question the group needed answered, and a tree that cannot beat logistic regression still tells us where the flexible model is not worth its complexity.
+
+**Individual findings versus shared-data comparisons**. Results from the individual notebooks were produced on different populations, features, and evaluation designs. They are described as the individuals reported them, and are not re-reported as results of this notebook. The comparisons later in this notebook are new, run on one shared panel with one protocol, so their numbers need not agree with the individual ones.
+
+All statements about teammates’ results come from the text of their own notebooks and have not been reproduced here. Some of those notebooks cannot be run from this project folder because inputs are missing (see “Source review”). Results are quoted only where a notebook states them in text.
+
+## Business Problem 
+
+PBS Utah wants to identify constituents who currently give **less than $1,200** in a fiscal year but may give **at least $1,200** the next year, so that limited prospect-research and cultivation capacity can be directed to the most promising people. Model scores are meant to support, not replace, fundraising staff judgment.
+
+## Analytic Problem
+
+- **Unit of Analysis**: One individual constituent in one feature fiscal year t. Organizations and the SYN-ORPHAN sentinel are excluded.
+- **Recognized Giving**: The sum of positive direct payments and positive soft credits, after exact duplicate soft-credit rows are removed. It is a constituent-recognition measure and <u>is not cash revenue</u>: the hard-credit payment behind a soft credit belongs to an organization and must not be counted again as extra cash. Direct and soft amounts should stay in separate columns.
+- **Eligibility**: Recognized giving in year t is below $1,200. How zero-giving constituents are treated is unresolved (decision 1).
+- **Target**: Recognized giving in year *t* + 1 is at least $1,200. Exactly $1,200 counts as a positive outcome.
+- **Rare Event**: Transitions across the threshold are very rare. In the population built for Clahan’s analysis, there were 55, 61, 42, 49, and 88 positives for feature years FY2021 through FY2025, among roughly 126,000 to 185,000 eligible rows per year. Accuracy is therefore uninformative, and ranking metrics matter.
+- **Time Safety**: Predictors may use only information available by the end of year *t*. Extract-date snapshot fields (age, sustainer status, annual-giving group, major-donor class) are never used. Evaluation is chronological, and if a donor-based split is ever used, spouses stay together.
+- **Interpretation**: Predictive ranking identifies who looks likely to cross the threshold. It does not show that solicitation, Passport engagement, or outreach *causes* higher giving.
+
+**Questions for the final notebook**. Which feature blocks (giving history, solicitation response, Passport engagement) add predictive value beyond an agreed benchmark, and does a more flexible algorithm improve on logistic regression enough to justify its complexity?
+
+## Individual Contributions
+
+| Member | Focus | What the individual work did | Tools | What it reports | 
+|:--|:--|:--|:--|:--|
+| Abdullah Khan | Giving-history feature engineering | Keeps only current donors with recognized giving above $0 and below $1,200, FY2021 to FY2024 feature years. Builds current and prior amounts, year-over-year change, trailing slope, direct and soft-credit frequencies, active giving years, per-active-year averages, prior and highest historical giving tiers, and recency (legacy household links used for recency only, never amounts). Compares a provisional benchmark (log current giving plus primary constituent type) with the benchmark plus the giving-history block, using L2-penalized logistic regression, three expanding-window folds, and permutation importance. Builds no FY2025 features. | Python (DuckDB, scikit-learn) | Results are generated by code; the notebook text states no numbers, and no rendered output was available to me. | 
+| Owen Simon | Prospect pool and solicitation-response features | A Python script builds 23 solicitation features per constituent and fiscal year (counts by channel, responses, response rates, prior-year and trailing three-year values), with a data dictionary. An R notebook adds them to a non-solicitation baseline in logistic regression, elastic net, random forest, and XGBoost (eight configurations) across three expanding-window folds, with training-time negative sampling and fixed hyperparameters. | Python script; R (caret, glmnet, randomForest, xgboost) | In text: mean average precision for elastic net 0.191 to 0.197, XGBoost 0.155 to 0.162, logistic regression 0.126 to 0.168, and random forest 0.124 to 0.140 when solicitation features are added. Historical giving dominates feature importance. FY2025 and FY2026 are reserved. |
+| Clahan Tran | Passport engagement, and the starting population | Built the eligible panel with inferred existence by year (this notebook’s starting population and its verification counts) (zero-giving constituents included once existence is established), then compares a provisional four-predictor giving-history logistic benchmark with the same model plus four Passport features. Uses a train FY2021 to FY2023 and validate FY2024 split, then refits on FY2021 to FY2024 and evaluates FY2025 once under a written plan, with a paired spouse-group bootstrap. | R (tidymodels) | Validation PR AUC 0.122 versus 0.128 (benchmark versus Passport model); final test 0.157 versus 0.161, and top-500 captures of 49.2 versus 51 of 88 positives. All bootstrap intervals for the difference include zero, so Passport added no demonstrable value. | 
+| Tama Wihongi | Logistic regression versus decision tree | Compares benchmark logistic regression with a tuned decision tree (rpart; 30-point grid over complexity, depth, and minimum node size) on the same shared panel, 11 baseline features, and three expanding-window folds, with average precision as the primary metric and top-500 precision and lift. Corrected finding: the tree produced constant predictions (a root-only tree) and did not improve on logistic regression. | R (tidymodels, rpart) | The notebook’s text is conditional on its own results. Per Tama’s corrected finding, logistic regression remains the more defensible benchmark. I did not see rendered output. |
+
+## Alignment of the Individual Analyses
+
+The tables compare what each analysis actually did. “Not visible” means the notebook relies on a file or definition that is not available to me.
+
+### Population and Data
+
+| Dimension | Abdullah | Owen | Clahan | Tama |
+|:--|:--|:--|:--|:--|
+| Eligible rows | Recognized giving above $0 and below $1,200 | `annual_giving` between $0.01 and $1,199.99 | Below $1,200 including zero, if existence is established by year *t* | Below $1,200 including non-donors by default (a switch can drop them) |
+| Existence by year | Implied by positive giving | Not visible | First recorded activity (payments, soft credits, campaign rows, Passport rows, legacy IDs) on or before year *t* | Depends on the panel file; the only panel code I found places every individual in ever |
+| Development feature years | FY2021 to FY2024 | FY2021 to FY2024 | FY2021 to FY2025 built; FY2025 later scored | Before FY2025 in development |
+| Recognized-giving definition | Direct above $0 plus soft above $0, exact duplicates removed | `annual_giving`, definition not visible | Same documented definition, paid positive direct payments only; amounts kept separate | `current_recognized_amount` from the panel |
+| Input data | Raw tables through DuckDB | baseline feature set + `solicitation_features.csv` | Raw tables | `donor_panel_time_safe.csv` |
+| Extract-date fields | Uses primary constituent type in the benchmark | Excludes fields ending `_snapshot` and `cultivation_` | None; constituents table used only for IDs and spouse links | Panel inputs include “membership” data; not verifed |
+
+### Working Specifications for the Development Dataset
+
+The specifications below are used to build and check the dataset only. They are working choices for the group synthesis, not group-approved decisions, and each can change when the open decisions above are settled.
+
+| Item | Working Specification |
+|:--|:--|
+| Unit | One individual constituent in one feature fiscal year *t* |
+| Existence | Eligible in year t only if recorded activity (a payment row, soft-credit row, solicitation row, Passport row, or linked legacy gift) is dated on or before the end of year *t* |
+| Eligible population | Existence supported by year t, and current recognized giving of at least $0 and below $1,200 |
+| Subgroup flag | `current_donor` = 1 when current recognized giving is above $0, so results can later be reported separately for current donors and zero-giving constituents |
+| Target | `major_donor_next_fy` = 1 when recognized giving in year t + 1 is at least $1,200 |
+| Recognized giving | Positive paid direct payments plus positive soft credits, exact duplicate rows removed; direct and soft amounts kept in separate columns; not cash revenue |
+| Provisional benchmark predictors | Log current giving, log highest annual giving observed through year t, active giving years, any soft credit through year *t* |
+| Primary evaluation metric | Average precision, kept distinct from trapezoidal PR AUC (defined at the end of this notebook) |
+| Development window | Feature years FY2021 to FY2024; outcomes FY2022 to FY2025 |
+| FY2025 | Feature year FY2025 (outcome FY2026) was previously evaluated in Clahan Tran’s individual analysis, so it is never described as untouched. It plays no part in development, and is scored once, with fixed models, in the confirmation section after a written plan |
+
+## Build the Shared Development Dataset
+
+Source tables are read once into an on-disk DuckDB database in R’s temporary folder and aggregated there, so the large transaction files are never held in R as full data frames. Only the small constituent-year summaries are collected into R. Source rows after FY2025 are dropped at the first aggregation step, so no FY2026 information reaches the panel.
+
+```{r}
+library(DBI)
+library(duckdb)
+library(here)
+library(scales)
+library(gt)
+library(tidyverse)
+
+major_threshold <- 1200
+
+# Fiscal years run July-June:
+# July-December belong to the following fiscal year.
+fiscal_year_from_date <- function(date) {
+  as.integer(if_else(month(date) >= 7, year(date) + 1L, year(date)))
+}
+
+# First fiscal year with modern payment records
+first_modern_fy <- 2021L
+
+# Development and confirmation feature years
+feature_years <- 2021:2024
+confirmation_year <- 2025L
+
+data_dir <- here("Data_Files")
+
+feature_years <- 2021:2024           # development feature years
+outcome_years <- feature_years + 1L  # FY2022-FY2025
+last_source_fy <- 2025L              # later source rows are never aggregated
+first_modern_fy <- 2021L             # unite payments and soft credits begin in FY2021
+
+# On-disk database in the session's temporary folder keeps memory use low.
+db_file <- file.path(tempdir(), "group_development.duckdb")
+con <- dbConnect(duckdb(), dbdir = db_file)
+
+run_sql <- function(sql) invisible(dbExecute(con, sql))
+q <- function(sql) dbGetQuery(con, sql)
+
+# Fiscal year of a date (July-December belong to the following fiscal year).
+# TRY_CAST makes the macro work whether a column was read as DATE or text.
+run_sql("CREATE OR REPLACE MACRO fy(d) AS
+  CASE WHEN month(TRY_CAST(d AS DATE)) >= 7
+       THEN year(TRY_CAST(d AS DATE)) + 1 ELSE year(TRY_CAST(d AS DATE)) END")
+
+load_csv <- function(table, file, columns = "*") {
+  run_sql(sprintf(
+    "CREATE OR REPLACE TABLE %s AS SELECT %s FROM read_csv_auto('%s', header = true, sample_size = -1, nullstr = '')",
+    table, columns, file.path(data_dir, file)
+  ))
+}
+
+# Exact duplicate removal needs every payment and soft-credit column.
+load_csv("payments_raw", "unite_payments.csv")
+load_csv("soft_raw", "soft_credits.csv")
+load_csv("constituents_raw", "constituents_w_memberships.csv")
+load_csv("campaign_codes_raw", "campaign_codes.csv", '"Marketing Code", "Communication Method"')
+load_csv("campaign_raw", "campaign_members.csv",
+         "constituent_id, marketing_code, responded, responded_date, campaign_start_date")
+load_csv("passport_raw", "passport_viewing.txt")
+load_csv("legacy_raw", "team_approach_legacy_payments.csv",
+         paste(c("gift_date", "payment_amount", paste0("constituent_id_", 1:7)), collapse = ", "))
+
+tibble(
+  table = c("unite_payments", "soft_credits", "constituents", "campaign_members",
+            "passport_viewing", "team_approach_legacy_payments"),
+  rows = c(
+    q("SELECT COUNT(*) FROM payments_raw")[[1]],
+    q("SELECT COUNT(*) FROM soft_raw")[[1]],
+    q("SELECT COUNT(*) FROM constituents_raw")[[1]],
+    q("SELECT COUNT(*) FROM campaign_raw")[[1]],
+    q("SELECT COUNT(*) FROM passport_raw")[[1]],
+    q("SELECT COUNT(*) FROM legacy_raw")[[1]]
+  )
+) |>
+  gt() |>
+  tab_header(
+    title = "PBS Utah Data Sources",
+    subtitle = "Original record counts before data preparation"
+  ) |>
+  cols_label(
+    table = "Data Source",
+    rows = "Total Records"
+  ) |>
+  fmt_number(
+    columns = rows,
+    decimals = 0,
+    use_seps = TRUE
+  )
+```
+
+### Individuals and Spouse Groups
+
+Constituent type is used only to remove organization records. Primary constituent type and every other constituents-table attribute are **not** predictors. Spouse links are used only to build a `split_group_id` (for donor-based splits that keep spouses together), never as a feature.
+
+```{r}
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE individuals AS
+SELECT "Constituent ID" AS constituent_id, "Spouse Constituent ID" AS spouse_constituent_id
+FROM constituents_raw
+WHERE COALESCE("Constituent ID", '') NOT IN ('', 'SYN-ORPHAN')
+  AND COALESCE("Constituent Type", '') NOT ILIKE '%Organization%'
+  AND COALESCE("Primary Constituent Type", '') NOT ILIKE '%Organization%'
+)---")
+
+individuals <- q("SELECT * FROM individuals")
+
+excluded_constituents <- q(r"---(
+SELECT "Constituent ID" AS constituent_id, "Constituent Type" AS constituent_type
+FROM constituents_raw
+WHERE "Constituent ID" NOT IN (SELECT constituent_id FROM individuals)
+)---")
+
+gt(excluded_constituents)
+```
+
+```{r}
+# Symmetrize spouse links so a pair shares one group id even if only one lists the other.
+spouse_pairs <- individuals |>
+  filter(!is.na(spouse_constituent_id)) |>
+  transmute(constituent_id, partner_id = spouse_constituent_id)
+
+spouse_both_ways <- bind_rows(
+  spouse_pairs,
+  select(spouse_pairs, constituent_id = partner_id, partner_id = constituent_id)
+) |>
+  distinct()
+
+individuals <- individuals |>
+  left_join(
+    spouse_both_ways |>
+      group_by(constituent_id) |>
+      summarise(n_partners = n_distinct(partner_id), partner_min_id = min(partner_id), .groups = "drop"),
+    by = "constituent_id"
+  ) |>
+  mutate(split_group_id = pmin(constituent_id, partner_min_id, na.rm = TRUE))
+
+tibble(
+  n_individuals = nrow(individuals),
+  individuals_with_spouse_id = nrow(spouse_pairs),
+  spouse_id_not_in_individuals = sum(!spouse_pairs$partner_id %in% individuals$constituent_id),
+  individuals_with_multiple_partners = sum(individuals$n_partners > 1, na.rm = TRUE),
+  distinct_split_groups = n_distinct(individuals$split_group_id)
+) |>
+gt()
+```
+
+### Aggregate each source to constituent and fiscal year
+
+Each data source is processed to produce one row per constituent and fiscal year before joining the datasets. This ensures consistent aggregation and prevents duplicate records from inflating giving totals or engagement measures.
+
+- **Direct payments**: Remove exact duplicate records and aggregate positive, paid contributions by individual and fiscal year.
+- **Soft credits**: Remove exact duplicate records and aggregate positive soft credit amounts by individual and fiscal year.
+- **Solicitations**: Generate 23 features capturing solicitation activity, campaign responses, communication methods, response rates, and historical engagement. Prior-year and trailing three-year features are calculated using a complete constituent-year panel.
+- **Passport**: Aggregate viewing activity into features measuring titles viewed, genres watched, and average viewing completion.
+- **Legacy gifts**: Establish historical giving activity without assigning household-level gift amounts or counts to individual constituents.
+
+#### Direct Payments and Soft Credits
+
+```{r}
+# Remove exact duplicate records
+run_sql("CREATE OR REPLACE TEMP TABLE payments_dedup AS SELECT DISTINCT * FROM payments_raw")
+run_sql("CREATE OR REPLACE TEMP TABLE soft_dedup AS SELECT DISTINCT * FROM soft_raw")
+
+# Aggregate direct payments by constituent and fiscal year
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE direct_fy AS
+SELECT
+    donor_id AS constituent_id,
+    fy(credit_date)::INTEGER AS fiscal_year,
+    ROUND(SUM(payment_amount)::DOUBLE, 2) AS direct_amount,
+    COUNT(*)::INTEGER AS direct_payment_count
+FROM payments_dedup
+WHERE pledge_gift_status = 'Paid'
+  AND payment_amount > 0
+  AND donor_id IN (SELECT constituent_id FROM individuals)
+  AND fy(credit_date) BETWEEN 2021 AND 2025
+GROUP BY 1, 2
+)---")
+
+# Aggregate soft credits by constituent and fiscal year
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE soft_fy AS
+SELECT
+    "Soft Credit Constituent ID" AS constituent_id,
+    fy("Credit Date")::INTEGER AS fiscal_year,
+    ROUND(SUM("Credit Amount")::DOUBLE, 2) AS soft_amount,
+    COUNT(*)::INTEGER AS soft_credit_count
+FROM soft_dedup
+WHERE "Credit Amount" > 0
+  AND "Soft Credit Constituent ID" IN (
+      SELECT constituent_id FROM individuals
+  )
+  AND fy("Credit Date") BETWEEN 2021 AND 2025
+GROUP BY 1, 2
+)---")
+```
+
+#### Solicitation Feature Engineering
+
+```{r}
+# ============================================================
+# Step 1: Map marketing codes to communication methods
+# ============================================================
+
+# Preserve the first occurrence of each marketing code,
+# consistent with the Python feature-engineering script.
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE campaign_codes_unique AS
+SELECT
+    "Marketing Code" AS marketing_code,
+    "Communication Method" AS method
+FROM (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY "Marketing Code"
+        ) AS rn
+    FROM campaign_codes_raw
+)
+WHERE rn = 1
+)---")
+
+
+# ============================================================
+# Step 2: Aggregate annual solicitation activity
+# ============================================================
+
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE campaign_annual AS
+
+WITH base AS (
+    SELECT
+        c.constituent_id,
+        fy(c.campaign_start_date)::INTEGER AS fiscal_year,
+        c.marketing_code,
+
+        (
+            COALESCE(
+                lower(trim(CAST(c.responded AS VARCHAR)))
+                    IN ('true', '1', 'yes'),
+                FALSE
+            )
+            AND TRY_CAST(c.responded_date AS DATE) IS NOT NULL
+            AND fy(c.responded_date) = fy(c.campaign_start_date)
+        ) AS valid_response,
+
+        lower(k.method) AS method,
+        k.marketing_code IS NOT NULL AS code_linked
+
+    FROM campaign_raw c
+
+    LEFT JOIN campaign_codes_unique k
+        ON c.marketing_code = k.marketing_code
+
+    WHERE c.constituent_id IN (
+        SELECT constituent_id FROM individuals
+    )
+      AND fy(c.campaign_start_date) BETWEEN 2019 AND 2025
+)
+
+SELECT
+    constituent_id,
+    fiscal_year,
+
+    COUNT(*)::INTEGER AS solicitations,
+
+    COUNT(*) FILTER (
+        WHERE valid_response
+    )::INTEGER AS campaign_responses,
+
+    COUNT(*) FILTER (
+        WHERE code_linked
+    )::INTEGER AS campaign_codes_linked,
+
+    COUNT(DISTINCT marketing_code)::INTEGER
+        AS unique_campaigns_solicited,
+
+    COUNT(*) FILTER (
+        WHERE method = 'mail'
+    )::INTEGER AS solicitations_mail,
+
+    COUNT(*) FILTER (
+        WHERE method = 'phone'
+    )::INTEGER AS solicitations_phone,
+
+    COUNT(*) FILTER (
+        WHERE method = 'email'
+    )::INTEGER AS solicitations_email,
+
+    COUNT(*) FILTER (
+        WHERE method = 'digital'
+    )::INTEGER AS solicitations_digital,
+
+    COUNT(*) FILTER (
+        WHERE method = 'in-person'
+    )::INTEGER AS solicitations_in_person,
+
+    COUNT(*) FILTER (
+        WHERE method = 'miscellaneous'
+    )::INTEGER AS solicitations_miscellaneous,
+
+    COUNT(*) FILTER (
+        WHERE method = 'mail' AND valid_response
+    )::INTEGER AS responses_mail,
+
+    COUNT(*) FILTER (
+        WHERE method = 'phone' AND valid_response
+    )::INTEGER AS responses_phone,
+
+    COUNT(*) FILTER (
+        WHERE method = 'email' AND valid_response
+    )::INTEGER AS responses_email,
+
+    COUNT(*) FILTER (
+        WHERE method = 'digital' AND valid_response
+    )::INTEGER AS responses_digital,
+
+    COUNT(*) FILTER (
+        WHERE method = 'in-person' AND valid_response
+    )::INTEGER AS responses_in_person,
+
+    COUNT(*) FILTER (
+        WHERE method = 'miscellaneous' AND valid_response
+    )::INTEGER AS responses_miscellaneous
+
+FROM base
+GROUP BY constituent_id, fiscal_year
+)---")
+
+
+# ============================================================
+# Step 3: Create complete constituent-year panel
+# ============================================================
+
+# Include FY2019-FY2020 to support trailing three-year
+# calculations beginning in FY2021.
+
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE campaign_panel AS
+
+SELECT
+    i.constituent_id,
+    y.fiscal_year,
+
+    COALESCE(a.solicitations, 0) AS solicitations,
+    COALESCE(a.campaign_responses, 0) AS campaign_responses,
+    COALESCE(a.campaign_codes_linked, 0) AS campaign_codes_linked,
+    COALESCE(a.unique_campaigns_solicited, 0) AS unique_campaigns_solicited,
+
+    COALESCE(a.solicitations_mail, 0) AS solicitations_mail,
+    COALESCE(a.solicitations_phone, 0) AS solicitations_phone,
+    COALESCE(a.solicitations_email, 0) AS solicitations_email,
+    COALESCE(a.solicitations_digital, 0) AS solicitations_digital,
+    COALESCE(a.solicitations_in_person, 0) AS solicitations_in_person,
+    COALESCE(a.solicitations_miscellaneous, 0) AS solicitations_miscellaneous,
+
+    COALESCE(a.responses_mail, 0) AS responses_mail,
+    COALESCE(a.responses_phone, 0) AS responses_phone,
+    COALESCE(a.responses_email, 0) AS responses_email,
+    COALESCE(a.responses_digital, 0) AS responses_digital,
+    COALESCE(a.responses_in_person, 0) AS responses_in_person,
+    COALESCE(a.responses_miscellaneous, 0) AS responses_miscellaneous
+
+FROM (
+    SELECT DISTINCT constituent_id
+    FROM individuals
+) i
+
+CROSS JOIN generate_series(2019, 2025) AS y(fiscal_year)
+
+LEFT JOIN campaign_annual a
+    ON i.constituent_id = a.constituent_id
+   AND y.fiscal_year = a.fiscal_year
+)---")
+
+
+# ============================================================
+# Step 4: Calculate historical solicitation features
+# ============================================================
+
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE campaign_fy AS
+
+WITH historical AS (
+    SELECT
+        *,
+
+        COALESCE(
+            LAG(solicitations, 1) OVER w, 0
+        ) AS prior_fy_solicitations,
+
+        COALESCE(
+            LAG(campaign_responses, 1) OVER w, 0
+        ) AS prior_fy_campaign_responses,
+
+        SUM(solicitations) OVER (
+            PARTITION BY constituent_id
+            ORDER BY fiscal_year
+            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+        ) AS trailing_3_fy_solicitations,
+
+        SUM(campaign_responses) OVER (
+            PARTITION BY constituent_id
+            ORDER BY fiscal_year
+            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+        ) AS trailing_3_fy_campaign_responses
+
+    FROM campaign_panel
+
+    WINDOW w AS (
+        PARTITION BY constituent_id
+        ORDER BY fiscal_year
+    )
+)
+
+SELECT
+    constituent_id,
+    fiscal_year,
+
+    trailing_3_fy_solicitations,
+
+    campaign_responses::DOUBLE /
+        NULLIF(solicitations, 0) AS campaign_response_rate,
+
+    solicitations_digital,
+    prior_fy_solicitations,
+    solicitations,
+
+    trailing_3_fy_campaign_responses::DOUBLE /
+        NULLIF(trailing_3_fy_solicitations, 0)
+        AS trailing_3_fy_response_rate,
+
+    solicitations_miscellaneous,
+    trailing_3_fy_campaign_responses,
+    unique_campaigns_solicited,
+    campaign_codes_linked,
+    responses_miscellaneous,
+    solicitations_mail,
+    solicitations_email,
+    prior_fy_campaign_responses,
+    campaign_responses,
+    solicitations_phone,
+    solicitations_in_person,
+    responses_mail,
+    responses_phone,
+    responses_email,
+    responses_digital,
+    responses_in_person,
+
+    campaign_codes_linked::DOUBLE /
+        NULLIF(solicitations, 0) AS campaign_code_link_rate
+
+FROM historical
+WHERE fiscal_year BETWEEN 2021 AND 2025
+)---")
+```
+
+#### Passport Viewing
+
+```{r}
+run_sql(r"---(
+CREATE OR REPLACE TEMP TABLE passport_fy AS
+SELECT
+    constituent_id,
+    fiscal_year::INTEGER AS fiscal_year,
+    SUM(titles_viewed)::INTEGER AS total_titles_viewed,
+    COUNT(DISTINCT genre)::INTEGER AS genres_viewed,
+    SUM(titles_viewed * mean_percent_watched)::DOUBLE /
+        SUM(titles_viewed) AS weighted_mean_percent_watched
+FROM passport_raw
+WHERE constituent_id IN (
+    SELECT constituent_id FROM individuals
+)
+  AND fiscal_year BETWEEN 2021 AND 2025
+GROUP BY 1, 2
+)---")
+```
+
+#### Legacy Gifts
+
+```{r}
+# A legacy row can list up to seven household members.
+# Unpivoting is used only to link dates to individuals.
+# Amounts and counts are never carried forward.
+
+legacy_union <- paste(
+  sprintf(
+    "SELECT gift_date, payment_amount,
+            constituent_id_%d AS constituent_id
+     FROM legacy_raw
+     WHERE constituent_id_%d IS NOT NULL",
+    1:7,
+    1:7
+  ),
+  collapse = " UNION ALL "
+)
+
+run_sql(
+  paste(
+    "CREATE OR REPLACE TEMP TABLE legacy_links AS",
+    legacy_union
+  )
+)
+```
+
+### Source Accounting: Duplicates and Excluded Records
+
+The table accounts for source records before aggregation. FY2019–FY2020 campaign records are retained as historical lookback observations for the FY2021 trailing three-year solicitation features; they are not FY2021–FY2025 modeling rows. Counts refer to source records, not the number of rows in the completed solicitation feature panel.
+
+```{r}
+id_class_sql <- function(col) {
+  sprintf(
+    "CASE WHEN %s = 'SYN-ORPHAN' THEN 'SYN-ORPHAN'
+          WHEN %s IN (SELECT constituent_id FROM individuals) THEN 'individual'
+          WHEN %s IN (SELECT \"Constituent ID\" FROM constituents_raw) THEN 'organization record'
+          ELSE 'unmatched ID' END",
+    col, col, col
+  )
+}
+
+class_counts <- function(from_sql, id_col, fy_expr) {
+  q(sprintf(
+    "SELECT %s AS id_class,
+            CASE
+              WHEN %s < 2021 THEN 'before FY2021'
+              WHEN %s BETWEEN 2021 AND 2025 THEN 'in window'
+              WHEN %s > 2025 THEN 'after FY2025'
+              ELSE 'missing fiscal year'
+            END AS fy_window,
+            COUNT(*) AS n_rows
+     FROM %s
+     GROUP BY 1, 2",
+    id_class_sql(id_col),
+    fy_expr,
+    fy_expr,
+    fy_expr,
+    from_sql
+  ))
+}
+
+steps_from_counts <- function(source, raw, deduped, kept_label, cc) {
+  rows_of <- function(cls, win = NA_character_) {
+    sum(cc$n_rows[cc$id_class == cls & (is.na(win) | cc$fy_window == win)])
+  }
+  tibble(
+    source = source,
+    step = c(
+      "Raw rows",
+      if (!is.na(deduped)) "After exact-duplicate removal",
+      kept_label,
+      "  excluded: SYN-ORPHAN",
+      "  excluded: organization records",
+      "  excluded: unmatched IDs",
+      "  individual rows before FY2021 (historical lookback)",
+      "  excluded: individual rows after FY2025",
+      "  excluded: individual rows with missing fiscal year",
+      "  retained: individual source rows, FY2021-FY2025"
+    ),
+    rows = c(
+      raw,
+      if (!is.na(deduped)) deduped,
+      sum(cc$n_rows),
+      rows_of("SYN-ORPHAN"), rows_of("organization record"), rows_of("unmatched ID"),
+      rows_of("individual", "before FY2021"),
+      rows_of("individual", "after FY2025"),
+      rows_of("individual", "missing fiscal year"),
+      rows_of("individual", "in window")
+    )
+  )
+}
+
+count_rows <- function(sql) q(sql)[[1]]
+
+payments_cc <- class_counts(
+  "payments_dedup WHERE pledge_gift_status = 'Paid' AND payment_amount > 0", "donor_id", "fy(credit_date)"
+)
+soft_cc <- class_counts(
+  "soft_dedup WHERE \"Credit Amount\" > 0", "\"Soft Credit Constituent ID\"", "fy(\"Credit Date\")"
+)
+campaign_cc <- class_counts("campaign_raw", "constituent_id", "fy(campaign_start_date)")
+passport_cc <- class_counts("passport_raw", "constituent_id", "fiscal_year")
+
+source_accounting <- bind_rows(
+  steps_from_counts(
+    "unite_payments", count_rows("SELECT COUNT(*) FROM payments_raw"),
+    count_rows("SELECT COUNT(*) FROM payments_dedup"), "Paid and positive amount", payments_cc
+  ),
+  steps_from_counts(
+    "soft_credits", count_rows("SELECT COUNT(*) FROM soft_raw"),
+    count_rows("SELECT COUNT(*) FROM soft_dedup"), "Positive credit amount", soft_cc
+  ),
+  steps_from_counts(
+    "campaign_members", count_rows("SELECT COUNT(*) FROM campaign_raw"),
+    NA_integer_, "Campaign source rows (including missing dates)", campaign_cc
+  ),
+  steps_from_counts(
+    "passport_viewing", count_rows("SELECT COUNT(*) FROM passport_raw"),
+    NA_integer_, "All rows", passport_cc
+  )
+)
+
+# Legacy: counted in household links (a row can link up to seven people).
+legacy_link_cc <- q(sprintf(
+  "SELECT %s AS id_class, COUNT(*) AS n_links FROM legacy_links GROUP BY 1", id_class_sql("constituent_id")
+))
+legacy_accounting <- tibble(
+  source = "team_approach_legacy_payments",
+  step = c("Raw rows", "  rows linked to no constituent", "Person links (up to 7 per row)",
+           "  links excluded: not an individual", "  links used for existence and recency only"),
+  rows = c(
+    count_rows("SELECT COUNT(*) FROM legacy_raw"),
+    count_rows(paste("SELECT COUNT(*) FROM legacy_raw WHERE",
+                     paste0("constituent_id_", 1:7, " IS NULL", collapse = " AND "))),
+    sum(legacy_link_cc$n_links),
+    sum(legacy_link_cc$n_links[legacy_link_cc$id_class != "individual"]),
+    sum(legacy_link_cc$n_links[legacy_link_cc$id_class == "individual"])
+  )
+)
+
+bind_rows(source_accounting, legacy_accounting) |>
+  gt() |>
+  tab_header(
+    title = "Source Accounting: Duplicates and Excluded Records"
+  ) |>
+  cols_label(
+    source = "Data Source",
+    step = "Processing Step",
+    rows = "Rows"
+  ) |>
+  fmt_number(
+    columns = rows,
+    decimals = 0,
+    use_seps = TRUE
+  )
+```
+
+### Establish Existence by Feature Year
+
+The constituents table is an extract-date file without a creation date. Therefore, we cannot determine when each constituent first existed from that table alone.
+
+We define a constituent's **first activity fiscal year** as the earliest fiscal year with recorded activity in any of the five sources: direct payments, soft credits, solicitations, Passport viewing, or linked legacy gifts.
+
+A constituent is eligible for inclusion in feature year *t* only when their first recorded activity occurred in or before that fiscal year. This prevents later activity from establishing eligibility in earlier years.
+
+Constituents with no recorded activity are excluded. This approach may exclude individuals who existed earlier but had not yet generated activity in the available records.
+
+```{r}
+# ============================================================
+# Identify First Recorded Activity by Source
+# ============================================================
+
+existence_sources <- q(r"---(
+SELECT
+    i.constituent_id,
+
+    p.payments_first_fy,
+    s.soft_first_fy,
+    c.campaign_first_fy,
+    a.passport_first_fy,
+    l.legacy_first_fy,
+    l.legacy_last_gift_fy
+
+FROM individuals i
+
+LEFT JOIN (
+    SELECT
+        donor_id AS constituent_id,
+        MIN(fy(credit_date))::INTEGER AS payments_first_fy
+    FROM payments_raw
+    WHERE fy(credit_date) <= 2025
+    GROUP BY 1
+) p USING (constituent_id)
+
+LEFT JOIN (
+    SELECT
+        "Soft Credit Constituent ID" AS constituent_id,
+        MIN(fy("Credit Date"))::INTEGER AS soft_first_fy
+    FROM soft_raw
+    WHERE fy("Credit Date") <= 2025
+    GROUP BY 1
+) s USING (constituent_id)
+
+LEFT JOIN (
+    SELECT
+        constituent_id,
+        MIN(fy(campaign_start_date))::INTEGER AS campaign_first_fy
+    FROM campaign_raw
+    WHERE fy(campaign_start_date) <= 2025
+    GROUP BY 1
+) c USING (constituent_id)
+
+LEFT JOIN (
+    SELECT
+        constituent_id,
+        MIN(fiscal_year)::INTEGER AS passport_first_fy
+    FROM passport_raw
+    WHERE fiscal_year <= 2025
+    GROUP BY 1
+) a USING (constituent_id)
+
+LEFT JOIN (
+    SELECT
+        constituent_id,
+        MIN(fy(gift_date))::INTEGER AS legacy_first_fy,
+        MAX(
+            CASE
+                WHEN payment_amount > 0 THEN fy(gift_date)
+            END
+        )::INTEGER AS legacy_last_gift_fy
+    FROM legacy_links
+    WHERE gift_date IS NOT NULL
+      AND fy(gift_date) <= 2025
+    GROUP BY 1
+) l USING (constituent_id)
+
+)---")
+
+# ============================================================
+# Determine Earliest Activity Across Sources
+# ============================================================
+
+existence <- existence_sources |>
+  mutate(
+    first_activity_fy = pmin(
+      payments_first_fy,
+      soft_first_fy,
+      campaign_first_fy,
+      passport_first_fy,
+      legacy_first_fy,
+      na.rm = TRUE
+    ),
+    first_activity_fy = if_else(
+      is.infinite(first_activity_fy),
+      NA_real_,
+      first_activity_fy
+    )
+  )
+```
+
+```{r}
+# ============================================================
+# Summarize Activity Coverage by Source
+# ============================================================
+
+existence |>
+  summarise(
+    individuals = n(),
+    with_payments = sum(!is.na(payments_first_fy)),
+    with_soft_credits = sum(!is.na(soft_first_fy)),
+    with_campaign = sum(!is.na(campaign_first_fy)),
+    with_passport = sum(!is.na(passport_first_fy)),
+    with_legacy = sum(!is.na(legacy_first_fy)),
+    no_activity_anywhere = sum(is.na(first_activity_fy))
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "metric",
+    values_to = "count"
+  ) |>
+  mutate(
+    metric = recode(
+      metric,
+      individuals = "Total Individuals",
+      with_payments = "With Direct Payments",
+      with_soft_credits = "With Soft Credits",
+      with_campaign = "With Solicitation Activity",
+      with_passport = "With Passport Activity",
+      with_legacy = "With Legacy Giving",
+      no_activity_anywhere = "No Recorded Activity"
+    )
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Constituent Activity Coverage",
+    subtitle = "Recorded activity across five data sources"
+  ) |>
+  cols_label(
+    metric = "Activity Source",
+    count = "Constituents"
+  ) |>
+  fmt_number(
+    columns = count,
+    decimals = 0,
+    use_seps = TRUE
+  )
+```
+
+```{r}
+# ============================================================
+# Summarize Constituents Established by Feature Year
+# ============================================================
+map_dfr(feature_years, \(year) {
+
+  established <- sum(
+    existence$first_activity_fy <= year,
+    na.rm = TRUE
+  )
+
+  tibble(
+    fiscal_year = year,
+    established_by_fy_end = established,
+    share_of_individuals = established / nrow(existence)
+  )
+
+}) |>
+  gt() |>
+  tab_header(
+    title = "Constituent Existence by Fiscal Year",
+    subtitle = "Individuals with recorded activity on or before each fiscal year"
+  ) |>
+  cols_label(
+    fiscal_year = "Fiscal Year",
+    established_by_fy_end = "Established Constituents",
+    share_of_individuals = "Share of All Individuals"
+  ) |>
+  fmt_number(
+    columns = established_by_fy_end,
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_percent(
+    columns = share_of_individuals,
+    decimals = 1
+  )
+```
+
+### Assemble the Development Panel
+
+#### Load and Combine Annual Source Tables
+
+```{r}
+direct_fy <- q("SELECT * FROM direct_fy")
+soft_fy <- q("SELECT * FROM soft_fy")
+campaign_fy <- q("SELECT * FROM campaign_fy")
+passport_fy <- q("SELECT * FROM passport_fy")
+
+# Direct and soft amounts stay separate.
+# Recognized giving is their sum, not cash revenue.
+
+giving_year <- full_join(
+  direct_fy,
+  soft_fy,
+  by = c("constituent_id", "fiscal_year")
+) |>
+  mutate(
+    direct_amount = coalesce(direct_amount, 0),
+    soft_amount = coalesce(soft_amount, 0),
+    direct_payment_count = coalesce(direct_payment_count, 0L),
+    soft_credit_count = coalesce(soft_credit_count, 0L),
+    recognized_amount = round(direct_amount + soft_amount, 2)
+  )
+
+legacy_recency <- existence |>
+  filter(!is.na(legacy_last_gift_fy)) |>
+  select(constituent_id, legacy_last_gift_fy)
+```
+
+#### Define Join Logging and Giving Tiers
+
+```{r}
+join_log <- tibble(
+  step = character(),
+  rows = integer()
+)
+
+log_rows <- function(df, step) {
+  n <- nrow(df)
+
+  join_log <<- bind_rows(
+    join_log,
+    tibble(step = step, rows = n)
+  )
+
+  df
+}
+
+tier_levels <- c(
+  "None",
+  "Entry (<$120)",
+  "Sustaining ($120-$599)",
+  "Upper-mid ($600-$1,199)",
+  "Major ($1,200+)"
+)
+
+amount_tier <- function(x) {
+  factor(
+    case_when(
+      is.na(x) ~ NA_character_,
+      x <= 0 ~ tier_levels[1],
+      x < 120 ~ tier_levels[2],
+      x < 600 ~ tier_levels[3],
+      x < major_threshold ~ tier_levels[4],
+      TRUE ~ tier_levels[5]
+    ),
+    levels = tier_levels
+  )
+}
+```
+
+#### Assemble the Constituent-Year Panel
+
+```{r}
+assemble_panel <- function(years, giving_year) {
+
+  # Prior-year and outcome-year giving
+  giving_lag1 <- giving_year |>
+    transmute(
+      constituent_id,
+      fiscal_year = fiscal_year + 1L,
+      recognized_lag1 = recognized_amount
+    )
+
+  giving_lag2 <- giving_year |>
+    transmute(
+      constituent_id,
+      fiscal_year = fiscal_year + 2L,
+      recognized_lag2 = recognized_amount
+    )
+
+  giving_next <- giving_year |>
+    transmute(
+      constituent_id,
+      fiscal_year = fiscal_year - 1L,
+      next_direct_amount = direct_amount,
+      next_soft_amount = soft_amount,
+      next_recognized_amount = recognized_amount
+    )
+
+  existence |>
+    filter(!is.na(first_activity_fy)) |>
+    select(
+      constituent_id,
+      first_activity_fy,
+      legacy_last_gift_fy
+    ) |>
+    cross_join(tibble(fiscal_year = years)) |>
+    filter(first_activity_fy <= fiscal_year) |>
+    log_rows("Existence grid (constituent x feature year)") |>
+
+    # Current-year giving
+    left_join(
+      giving_year,
+      by = c("constituent_id", "fiscal_year")
+    ) |>
+    mutate(
+      across(
+        c(direct_amount, soft_amount, recognized_amount),
+        \(x) coalesce(x, 0)
+      ),
+      across(
+        c(direct_payment_count, soft_credit_count),
+        \(x) coalesce(x, 0L)
+      )
+    ) |>
+    log_rows("+ current-year giving") |>
+
+    # Cumulative giving history
+    group_by(constituent_id) |>
+    arrange(fiscal_year, .by_group = TRUE) |>
+    mutate(
+      cumulative_direct_amount = cumsum(direct_amount),
+      cumulative_soft_amount = cumsum(soft_amount),
+      cumulative_recognized_amount = cumsum(recognized_amount),
+
+      cumulative_direct_payment_count = cumsum(direct_payment_count),
+      cumulative_soft_credit_count = cumsum(soft_credit_count),
+
+      active_giving_years = cumsum(recognized_amount > 0),
+
+      peak_annual_giving_to_date = cummax(recognized_amount),
+
+      prior_modern_gift_fy = na_if(
+        lag(
+          cummax(
+            if_else(recognized_amount > 0, fiscal_year, 0L)
+          ),
+          default = 0L
+        ),
+        0L
+      )
+    ) |>
+    ungroup() |>
+
+    # Prior-year and next-year giving
+    left_join(
+      giving_lag1,
+      by = c("constituent_id", "fiscal_year")
+    ) |>
+    left_join(
+      giving_lag2,
+      by = c("constituent_id", "fiscal_year")
+    ) |>
+    left_join(
+      giving_next,
+      by = c("constituent_id", "fiscal_year")
+    ) |>
+    log_rows("+ prior and next-year giving") |>
+
+    # All 23 solicitation features
+    left_join(
+      campaign_fy,
+      by = c("constituent_id", "fiscal_year")
+    ) |>
+    log_rows("+ 23 solicitation features") |>
+
+    # Passport
+    left_join(
+      passport_fy,
+      by = c("constituent_id", "fiscal_year")
+    ) |>
+    log_rows("+ Passport") |>
+
+    # Spouse group
+    left_join(
+      select(individuals, constituent_id, split_group_id),
+      by = "constituent_id"
+    ) |>
+    log_rows("+ spouse group id")
+}
+
+panel <- assemble_panel(feature_years, giving_year)
+```
+
+#### Engineer the Modeling Variables
+
+```{r}
+engineer_panel <- function(panel) {
+
+  panel |>
+    mutate(
+      # Outcome-year giving
+      across(
+        starts_with("next_"),
+        \(x) coalesce(x, 0)
+      ),
+
+      # Solicitation counts
+      # Rates remain NA when their denominators are zero.
+      across(
+        c(
+          solicitations,
+          campaign_responses,
+          campaign_codes_linked,
+          unique_campaigns_solicited,
+          solicitations_digital,
+          solicitations_miscellaneous,
+          solicitations_mail,
+          solicitations_email,
+          solicitations_phone,
+          solicitations_in_person,
+          responses_miscellaneous,
+          responses_mail,
+          responses_phone,
+          responses_email,
+          responses_digital,
+          responses_in_person,
+          prior_fy_solicitations,
+          prior_fy_campaign_responses,
+          trailing_3_fy_solicitations,
+          trailing_3_fy_campaign_responses
+        ),
+        \(x) coalesce(x, 0)
+      ),
+
+      # Outcome and subgroup
+      major_donor_next_fy = as.integer(
+        next_recognized_amount >= major_threshold
+      ),
+
+      current_donor = as.integer(recognized_amount > 0),
+
+      # Benchmark predictors
+      log_current_giving = log1p(recognized_amount),
+
+      log_peak_annual_giving = log1p(
+        peak_annual_giving_to_date
+      ),
+
+      any_soft_credit_to_date = as.integer(
+        cumulative_soft_amount > 0
+      ),
+
+      # Giving history
+      prior_recognized_amount = if_else(
+        fiscal_year == first_modern_fy,
+        NA_real_,
+        coalesce(recognized_lag1, 0)
+      ),
+
+      two_years_back = if_else(
+        fiscal_year <= first_modern_fy + 1L,
+        NA_real_,
+        coalesce(recognized_lag2, 0)
+      ),
+
+      yoy_change = recognized_amount - prior_recognized_amount,
+
+      trailing_three_year_slope = case_when(
+        fiscal_year == first_modern_fy ~ NA_real_,
+
+        fiscal_year == first_modern_fy + 1L ~
+          recognized_amount - prior_recognized_amount,
+
+        TRUE ~ (recognized_amount - two_years_back) / 2
+      ),
+
+      prior_giving_tier = amount_tier(
+        prior_recognized_amount
+      ),
+
+      highest_giving_tier_to_date = amount_tier(
+        peak_annual_giving_to_date
+      ),
+
+      cumulative_gift_count =
+        cumulative_direct_payment_count +
+        cumulative_soft_credit_count,
+
+      average_gifts_per_active_year =
+        cumulative_gift_count / pmax(active_giving_years, 1),
+
+      average_recognized_per_active_year =
+        cumulative_recognized_amount / pmax(active_giving_years, 1),
+
+      # Giving recency
+      prior_gift_fy = case_when(
+        is.na(prior_modern_gift_fy) ~ legacy_last_gift_fy,
+
+        is.na(legacy_last_gift_fy) ~ prior_modern_gift_fy,
+
+        TRUE ~ pmax(
+          prior_modern_gift_fy,
+          legacy_last_gift_fy
+        )
+      ),
+
+      years_since_prior_gift = fiscal_year - prior_gift_fy,
+
+      no_prior_gift_known = as.integer(
+        is.na(prior_gift_fy)
+      ),
+
+      # Passport
+      passport_recorded = as.integer(
+        !is.na(total_titles_viewed)
+      )
+    )
+}
+
+engineered <- engineer_panel(panel)
+```
+
+#### Define Predictor Groups
+
+```{r}
+id_columns <- c(
+  "constituent_id",
+  "split_group_id",
+  "fiscal_year"
+)
+
+eligibility_column <- "recognized_amount"
+subgroup_column <- "current_donor"
+
+audit_columns <- c(
+  "first_activity_fy",
+  "prior_modern_gift_fy",
+  "legacy_last_gift_fy",
+  "prior_gift_fy"
+)
+
+outcome_columns <- c(
+  "next_direct_amount",
+  "next_soft_amount",
+  "next_recognized_amount",
+  "major_donor_next_fy"
+)
+
+benchmark_predictors <- c(
+  "log_current_giving",
+  "log_peak_annual_giving",
+  "active_giving_years",
+  "any_soft_credit_to_date"
+)
+
+giving_history_candidates <- c(
+  "direct_amount",
+  "soft_amount",
+  "direct_payment_count",
+  "soft_credit_count",
+  "prior_recognized_amount",
+  "yoy_change",
+  "trailing_three_year_slope",
+  "prior_giving_tier",
+  "highest_giving_tier_to_date",
+  "peak_annual_giving_to_date",
+  "cumulative_direct_amount",
+  "cumulative_soft_amount",
+  "cumulative_recognized_amount",
+  "cumulative_direct_payment_count",
+  "cumulative_soft_credit_count",
+  "cumulative_gift_count",
+  "average_gifts_per_active_year",
+  "average_recognized_per_active_year",
+  "years_since_prior_gift",
+  "no_prior_gift_known"
+)
+
+# All 23 solicitation features
+solicitation_features <- c(
+  "trailing_3_fy_solicitations",
+  "campaign_response_rate",
+  "solicitations_digital",
+  "prior_fy_solicitations",
+  "solicitations",
+  "trailing_3_fy_response_rate",
+  "solicitations_miscellaneous",
+  "trailing_3_fy_campaign_responses",
+  "unique_campaigns_solicited",
+  "campaign_codes_linked",
+  "responses_miscellaneous",
+  "solicitations_mail",
+  "solicitations_email",
+  "prior_fy_campaign_responses",
+  "campaign_responses",
+  "solicitations_phone",
+  "solicitations_in_person",
+  "responses_mail",
+  "responses_phone",
+  "responses_email",
+  "responses_digital",
+  "responses_in_person",
+  "campaign_code_link_rate"
+)
+
+passport_features <- c(
+  "passport_recorded",
+  "total_titles_viewed",
+  "genres_viewed",
+  "weighted_mean_percent_watched"
+)
+
+predictor_columns <- c(
+  benchmark_predictors,
+  giving_history_candidates,
+  solicitation_features,
+  passport_features
+)
+
+stopifnot(
+  length(solicitation_features) == 23,
+  all(solicitation_features %in% names(engineered)),
+  !anyDuplicated(engineered[c("constituent_id", "fiscal_year")])
+)
+```
+
+#### Select Positive Current-Year Giving Prospects
+
+```{r}
+select_eligible <- function(engineered) {
+
+  engineered |>
+    filter(
+      recognized_amount > 0,
+      recognized_amount < major_threshold
+    ) |>
+    select(
+      all_of(c(
+        id_columns,
+        eligibility_column,
+        subgroup_column,
+        predictor_columns,
+        audit_columns,
+        outcome_columns
+      ))
+    )
+}
+
+dev_panel <- select_eligible(engineered)
+```
+
+#### Join Audit
+
+```{r}
+join_log |>
+  mutate(
+    rows_added_or_removed = rows - first(rows)
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Development Panel Join Audit",
+    subtitle = "Row counts throughout constituent-year panel construction"
+  ) |>
+  cols_label(
+    step = "Processing Step",
+    rows = "Panel Rows",
+    rows_added_or_removed = "Change from Initial Grid"
+  ) |>
+  fmt_number(
+    columns = c(rows, rows_added_or_removed),
+    decimals = 0,
+    use_seps = TRUE
+  )
+```
+
+#### Development Panel Summary
+
+```{r}
+tibble(
+  metric = c(
+    "Existence Grid Rows",
+    "Eligible Prospect Rows",
+    "Unique Constituents",
+    "Benchmark Predictors",
+    "Giving History Predictors",
+    "Solicitation Predictors",
+    "Passport Predictors",
+    "Total Predictors",
+    "Major-Donor Conversions"
+  ),
+  value = c(
+    join_log$rows[1],
+    nrow(dev_panel),
+    n_distinct(dev_panel$constituent_id),
+    length(benchmark_predictors),
+    length(giving_history_candidates),
+    length(solicitation_features),
+    length(passport_features),
+    length(predictor_columns),
+    sum(dev_panel$major_donor_next_fy, na.rm = TRUE)
+  )
+) |>
+  gt() |>
+  tab_header(
+    title = "Development Panel Summary",
+    subtitle = "FY2021–FY2024 features with next-year major-donor outcomes"
+  ) |>
+  cols_label(
+    metric = "Metric",
+    value = "Value"
+  ) |>
+  fmt_number(
+    columns = value,
+    decimals = 0,
+    use_seps = TRUE
+  )
+```
