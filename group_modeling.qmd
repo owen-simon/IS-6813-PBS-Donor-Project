@@ -19,7 +19,7 @@ execute:
 
 ## Notebook Status
 
-This is the group’s combined modeling report. It states the problem, records who contributed what, lists the decisions the group still has to make, records **working specifications** (not group-approved), builds and verifies the shared development dataset (feature years FY2021 to FY2024, outcomes FY2022 to FY2025), compares feature configurations and algorithms on development folds, and then runs one **fixed confirmation** on feature year FY2025 (outcome year FY2026) under a plan written before that period was scored.
+This report documents the PBS Utah group's combined modeling analysis to identify constituents likely to reach the $1,200 annual major-donor threshold. It summarizes the individual contributions, establishes the shared analytic population and modeling specifications, constructs and verifies the development dataset, and defines a consistent framework for comparing classification algorithms and predictor configurations. Development uses FY2021–FY2024 feature-year observations and FY2022–FY2025 outcomes. After model selection, the final configuration will be evaluated using FY2025 features and FY2026 outcomes as a previously exposed historical confirmation period.
 
 FY2025 was already examined in Clahan Tran’s individual analysis, so it is a **previously exposed historical confirmation period, not an independent untouched test**, and no model choice was changed after seeing it. The report does **not** copy the individual notebooks; they are source material to be synthesized, not stitched together.
 
@@ -37,13 +37,13 @@ PBS Utah wants to identify constituents who currently give **less than $1,200** 
 
 - **Unit of Analysis**: One individual constituent in one feature fiscal year t. Organizations and the SYN-ORPHAN sentinel are excluded.
 - **Recognized Giving**: The sum of positive direct payments and positive soft credits, after exact duplicate soft-credit rows are removed. It is a constituent-recognition measure and <u>is not cash revenue</u>: the hard-credit payment behind a soft credit belongs to an organization and must not be counted again as extra cash. Direct and soft amounts should stay in separate columns.
-- **Eligibility**: Recognized giving in year t is below $1,200. How zero-giving constituents are treated is unresolved (decision 1).
+- **Eligibility**: Constituents must have recognized giving greater than $0 and less than $1,200 in feature fiscal year t. Constituents with zero recognized giving are excluded from the modeling population. This restriction focuses the analysis on existing donors who may transition to major-donor status in the following fiscal year.
 - **Target**: Recognized giving in year *t* + 1 is at least $1,200. Exactly $1,200 counts as a positive outcome.
-- **Rare Event**: Transitions across the threshold are very rare. In the population built for Clahan’s analysis, there were 55, 61, 42, 49, and 88 positives for feature years FY2021 through FY2025, among roughly 126,000 to 185,000 eligible rows per year. Accuracy is therefore uninformative, and ranking metrics matter.
+- **Rare Event**: Transitions to major-donor status are uncommon, even among existing donors. Because relatively few eligible constituents reach the $1,200 threshold in the following fiscal year, classification accuracy alone is not an informative measure of model performance. Average precision and prospect-ranking metrics are prioritized to evaluate how effectively models identify potential major donors.
 - **Time Safety**: Predictors may use only information available by the end of year *t*. Extract-date snapshot fields (age, sustainer status, annual-giving group, major-donor class) are never used. Evaluation is chronological, and if a donor-based split is ever used, spouses stay together.
 - **Interpretation**: Predictive ranking identifies who looks likely to cross the threshold. It does not show that solicitation, Passport engagement, or outreach *causes* higher giving.
 
-**Questions for the final notebook**. Which feature blocks (giving history, solicitation response, Passport engagement) add predictive value beyond an agreed benchmark, and does a more flexible algorithm improve on logistic regression enough to justify its complexity?
+**Questions for the final notebook**. Which combination of classification algorithm and predictor configuration most effectively identifies existing donors likely to reach the $1,200 major-donor threshold in the following fiscal year? Do giving-history, solicitation-response, and Passport-engagement predictors improve performance beyond the four-predictor benchmark, and do more complex algorithms provide meaningful improvements in predictive performance and fundraising prospect prioritization?
 
 ## Individual Contributions
 
@@ -56,7 +56,7 @@ PBS Utah wants to identify constituents who currently give **less than $1,200** 
 
 ## Alignment of the Individual Analyses
 
-The tables compare what each analysis actually did. “Not visible” means the notebook relies on a file or definition that is not available to me.
+The following tables summarize the methodological differences across the four individual analyses, including prospect eligibility, data sources, predictor definitions, and evaluation procedures. These differences informed the development of a consistent group modeling framework. Individual results are retained as originally reported and should not be interpreted as directly comparable estimates of model performance.
 
 ### Population and Data
 
@@ -71,24 +71,26 @@ The tables compare what each analysis actually did. “Not visible” means the 
 
 ### Working Specifications for the Development Dataset
 
-The specifications below are used to build and check the dataset only. They are working choices for the group synthesis, not group-approved decisions, and each can change when the open decisions above are settled.
+The following specifications define the shared development dataset and modeling population used in the group analysis. They establish consistent eligibility criteria, target definitions, predictor availability, and evaluation periods across all candidate models. These specifications were finalized before the group model comparison.
 
 | Item | Working Specification |
 |:--|:--|
 | Unit | One individual constituent in one feature fiscal year *t* |
 | Existence | Eligible in year t only if recorded activity (a payment row, soft-credit row, solicitation row, Passport row, or linked legacy gift) is dated on or before the end of year *t* |
-| Eligible population | Existence supported by year t, and current recognized giving of at least $0 and below $1,200 |
-| Subgroup flag | `current_donor` = 1 when current recognized giving is above $0, so results can later be reported separately for current donors and zero-giving constituents |
+| Eligible population | Existence supported by year t, with current recognized giving greater than $0 and less than $1,200 |
+| Prospect pool | Existing donors with positive recognized giving below the major-donor threshold; zero-giving constituents are excluded from model development and evaluation |
 | Target | `major_donor_next_fy` = 1 when recognized giving in year t + 1 is at least $1,200 |
 | Recognized giving | Positive paid direct payments plus positive soft credits, exact duplicate rows removed; direct and soft amounts kept in separate columns; not cash revenue |
-| Provisional benchmark predictors | Log current giving, log highest annual giving observed through year t, active giving years, any soft credit through year *t* |
+| Benchmark predictors | Log current giving, log highest annual giving observed through year *t*, active giving years, and any soft credit received through year *t* |
 | Primary evaluation metric | Average precision, kept distinct from trapezoidal PR AUC (defined at the end of this notebook) |
 | Development window | Feature years FY2021 to FY2024; outcomes FY2022 to FY2025 |
-| FY2025 | Feature year FY2025 (outcome FY2026) was previously evaluated in Clahan Tran’s individual analysis, so it is never described as untouched. It plays no part in development, and is scored once, with fixed models, in the confirmation section after a written plan |
+| FY2025 confirmation | FY2025 features and FY2026 outcomes are excluded from group model development and selection. Because this period was previously examined in an individual analysis, it is treated as a historical confirmation period rather than a completely untouched independent test set. |
 
 ## Build the Shared Development Dataset
 
-Source tables are read once into an on-disk DuckDB database in R’s temporary folder and aggregated there, so the large transaction files are never held in R as full data frames. Only the small constituent-year summaries are collected into R. Source rows after FY2025 are dropped at the first aggregation step, so no FY2026 information reaches the panel.
+Source tables are loaded into an on-disk DuckDB database in R's temporary directory, allowing large transaction files to be processed without loading them entirely into memory. Aggregated constituent-year summaries are subsequently collected into R for feature engineering and validation.
+
+The development dataset uses FY2021–FY2024 feature-year observations and FY2022–FY2025 outcomes. Source records after FY2025 are excluded from development aggregations to prevent FY2026 information from entering the development dataset. FY2026 outcomes will be used separately for the historical confirmation evaluation after model selection.
 
 ```{r}
 library(DBI)
@@ -100,25 +102,25 @@ library(tidyverse)
 
 major_threshold <- 1200
 
-# Fiscal years run July-June:
-# July-December belong to the following fiscal year.
-fiscal_year_from_date <- function(date) {
-  as.integer(if_else(month(date) >= 7, year(date) + 1L, year(date)))
-}
+# ============================================================
+# Shared Modeling Constants
+# ============================================================
 
 # First fiscal year with modern payment records
 first_modern_fy <- 2021L
 
-# Development and confirmation feature years
+# Development feature years and corresponding outcome years
 feature_years <- 2021:2024
+outcome_years <- feature_years + 1L
+
+# Historical confirmation feature year
 confirmation_year <- 2025L
 
-data_dir <- here("Data_Files")
+# Latest fiscal year included in development source data
+last_source_fy <- 2025L
 
-feature_years <- 2021:2024           # development feature years
-outcome_years <- feature_years + 1L  # FY2022-FY2025
-last_source_fy <- 2025L              # later source rows are never aggregated
-first_modern_fy <- 2021L             # unite payments and soft credits begin in FY2021
+# Data directory
+data_dir <- here("Data_Files")
 
 # On-disk database in the session's temporary folder keeps memory use low.
 db_file <- file.path(tempdir(), "group_development.duckdb")
@@ -181,7 +183,7 @@ tibble(
 
 ### Individuals and Spouse Groups
 
-Constituent type is used only to remove organization records. Primary constituent type and every other constituents-table attribute are **not** predictors. Spouse links are used only to build a `split_group_id` (for donor-based splits that keep spouses together), never as a feature.
+Constituent type and primary constituent type are used to identify and exclude organization records. Other constituent attributes are not used as model predictors. Spouse relationships are retained to construct a `split_group_id` for potential household-aware analyses. This identifier is excluded from the predictor set. The primary model evaluation uses chronological expanding-window validation, so spouse grouping does not determine training and validation assignments.
 
 ```{r}
 run_sql(r"---(
@@ -205,7 +207,11 @@ gt(excluded_constituents)
 ```
 
 ```{r}
-# Symmetrize spouse links so a pair shares one group id even if only one lists the other.
+# Symmetrize spouse links and construct a grouping identifier
+# for directly linked constituents.
+# This is not a full connected-component household grouping.
+# The identifier is retained for reference but is not used
+# to determine chronological modeling folds.
 spouse_pairs <- individuals |>
   filter(!is.na(spouse_constituent_id)) |>
   transmute(constituent_id, partner_id = spouse_constituent_id)
@@ -239,8 +245,8 @@ gt()
 
 Each data source is processed to produce one row per constituent and fiscal year before joining the datasets. This ensures consistent aggregation and prevents duplicate records from inflating giving totals or engagement measures.
 
-- **Direct payments**: Remove exact duplicate records and aggregate positive, paid contributions by individual and fiscal year.
-- **Soft credits**: Remove exact duplicate records and aggregate positive soft credit amounts by individual and fiscal year.
+- **Direct payments**: Remove exact duplicate records and aggregate positive, paid contributions by constituent and fiscal year, including the total payment amount and number of payments.
+- **Soft credits**: Remove exact duplicate records and aggregate positive soft credit amounts by constituent and fiscal year, including the total credited amount and number of credits. Soft credits contribute to recognized giving but do not represent additional cash revenue.
 - **Solicitations**: Generate 23 features capturing solicitation activity, campaign responses, communication methods, response rates, and historical engagement. Prior-year and trailing three-year features are calculated using a complete constituent-year panel.
 - **Passport**: Aggregate viewing activity into features measuring titles viewed, genres watched, and average viewing completion.
 - **Legacy gifts**: Establish historical giving activity without assigning household-level gift amounts or counts to individual constituents.
@@ -288,6 +294,10 @@ GROUP BY 1, 2
 
 #### Solicitation Feature Engineering
 
+Solicitation features are constructed from campaign activity recorded through each feature fiscal year. A valid campaign response requires a positive response indicator, a valid response date, and a response occurring within the same fiscal year as the campaign start date. Annual counts, communication-channel activity, response rates, and historical solicitation measures are calculated at the constituent-year level.
+
+The historical calculations use FY2019–FY2020 solicitation records to support trailing three-year measures beginning in FY2021. Response rates are left missing when their denominators are zero and are subsequently handled by the modeling preprocessing procedure.
+
 ```{r}
 # ============================================================
 # Step 1: Map marketing codes to communication methods
@@ -305,6 +315,7 @@ FROM (
         *,
         ROW_NUMBER() OVER (
             PARTITION BY "Marketing Code"
+            ORDER BY "Communication Method" NULLS LAST
         ) AS rn
     FROM campaign_codes_raw
 )
@@ -565,6 +576,35 @@ WHERE constituent_id IN (
   AND fiscal_year BETWEEN 2021 AND 2025
 GROUP BY 1, 2
 )---")
+```
+
+```{r}
+# ============================================================
+# Verify Passport Aggregation
+# ============================================================
+
+passport_check <- q("
+  SELECT
+    COUNT(*) AS constituent_years,
+    SUM(
+      CASE WHEN total_titles_viewed <= 0 THEN 1 ELSE 0 END
+    ) AS nonpositive_title_counts,
+    SUM(
+      CASE
+        WHEN weighted_mean_percent_watched IS NULL
+        THEN 1 ELSE 0
+      END
+    ) AS missing_completion,
+    MIN(weighted_mean_percent_watched) AS min_completion,
+    MAX(weighted_mean_percent_watched) AS max_completion
+  FROM passport_fy
+")
+
+passport_check |>
+  gt() |>
+  tab_header(
+    title = "Passport Aggregation Verification"
+  )
 ```
 
 #### Legacy Gifts
@@ -1234,6 +1274,19 @@ engineer_panel <- function(panel) {
       # Passport
       passport_recorded = as.integer(
         !is.na(total_titles_viewed)
+      ),
+
+      # Preserve unavailable prior-year solicitation history
+      prior_fy_solicitations = if_else(
+        fiscal_year == first_modern_fy,
+        NA_real_,
+        as.numeric(prior_fy_solicitations)
+      ),
+
+      prior_fy_campaign_responses = if_else(
+        fiscal_year == first_modern_fy,
+        NA_real_,
+        as.numeric(prior_fy_campaign_responses)
       )
     )
 }
@@ -1394,8 +1447,7 @@ join_log |>
   )
 ```
 
-#### Development Panel Summary
-
+### Development Panel Summary
 ```{r}
 tibble(
   metric = c(
@@ -1434,5 +1486,1233 @@ tibble(
     columns = value,
     decimals = 0,
     use_seps = TRUE
+  )
+```
+
+### Feature Inventory
+
+```{r}
+# ============================================================
+# Feature Inventory
+# ============================================================
+
+feature_inventory <- tibble(
+  feature_group = c(
+    rep("Benchmark", length(benchmark_predictors)),
+    rep("Giving History", length(giving_history_candidates)),
+    rep("Solicitation", length(solicitation_features)),
+    rep("Passport", length(passport_features))
+  ),
+  feature = c(
+    benchmark_predictors,
+    giving_history_candidates,
+    solicitation_features,
+    passport_features
+  )
+) |>
+  mutate(
+    model_transform = case_when(
+      feature %in% c(
+        "prior_giving_tier",
+        "highest_giving_tier_to_date"
+      ) ~ "Categorical (dummy encoding)",
+
+      TRUE ~ "Numeric (imputation and scaling)"
+    )
+  )
+```
+
+```{r}
+feature_inventory |>
+  count(model_transform, name = "features") |>
+  gt() |>
+  tab_header(
+    title = "Feature Transformation Summary",
+    subtitle = "Predictor counts by preprocessing method"
+  ) |>
+  cols_label(
+    model_transform = "Model Transformation",
+    features = "Number of Features"
+  )
+```
+
+```{r}
+feature_inventory |>
+  count(feature_group, name = "features") |>
+  gt() |>
+  tab_header(
+    title = "Feature Inventory",
+    subtitle = "Predictor counts by feature group"
+  ) |>
+  cols_label(
+    feature_group = "Feature Group",
+    features = "Number of Predictors"
+  )
+```
+
+**Early-history treatment**. Payments, soft credits, and campaign records all begin in FY2021. For FY2021 rows, prior-year giving, year-over-year change, the giving trend, the prior-year tier, `prior_fy_solicitations`, and `prior_fy_campaign_responses` are therefore **unknown** (`NA`), not zero. The trailing three-year solicitation totals are sums over the years that exist from FY2021 onward, so FY2021 totals cover one observed year and FY2022 totals cover two; only FY2023 and later cover three.
+
+## Verification Checks
+
+### Development Panel Eligibility
+
+```{r}
+# ============================================================
+# Verify Development Panel Eligibility
+# ============================================================
+
+# Confirm all constituents meet the giving eligibility criteria
+stopifnot(
+  all(!is.na(dev_panel$recognized_amount)),
+  all(dev_panel$recognized_amount > 0),
+  all(dev_panel$recognized_amount < major_threshold)
+)
+
+# Confirm development data includes only FY2021-FY2024
+stopifnot(
+  all(dev_panel$fiscal_year %in% feature_years)
+)
+
+# Confirm all outcomes are present and binary
+stopifnot(
+  all(!is.na(dev_panel$major_donor_next_fy)),
+  all(dev_panel$major_donor_next_fy %in% c(0, 1))
+)
+
+# Display eligibility verification summary
+eligibility_checks <- tibble(
+  check = c(
+    "Positive recognized giving",
+    "Below major-donor threshold",
+    "Development fiscal years",
+    "Nonmissing outcomes",
+    "Binary outcomes"
+  ),
+  passed = c(
+    all(dev_panel$recognized_amount > 0),
+    all(dev_panel$recognized_amount < major_threshold),
+    all(dev_panel$fiscal_year %in% feature_years),
+    all(!is.na(dev_panel$major_donor_next_fy)),
+    all(dev_panel$major_donor_next_fy %in% c(0, 1))
+  )
+)
+
+eligibility_checks |>
+  mutate(
+    status = if_else(passed, "PASS", "FAIL")
+  ) |>
+  select(check, status) |>
+  gt() |>
+  tab_header(
+    title = "Development Panel Eligibility Verification",
+    subtitle = "Validation of prospect-pool and outcome criteria"
+  ) |>
+  cols_label(
+    check = "Verification Check",
+    status = "Status"
+  )
+```
+
+### Keys and Joins
+
+```{r}
+dup_keys <- function(df, keys) {
+  df |>
+    count(across(all_of(keys))) |>
+    filter(n > 1) |>
+    nrow()
+}
+
+key_checks <- tibble(
+  table = c(
+    "direct_fy", "soft_fy", "giving_year",
+    "campaign_fy", "passport_fy",
+    "existence", "individuals", "dev_panel"
+  ),
+  rows = c(
+    nrow(direct_fy),
+    nrow(soft_fy),
+    nrow(giving_year),
+    nrow(campaign_fy),
+    nrow(passport_fy),
+    nrow(existence),
+    nrow(individuals),
+    nrow(dev_panel)
+  ),
+  duplicate_keys = c(
+    dup_keys(direct_fy, c("constituent_id", "fiscal_year")),
+    dup_keys(soft_fy, c("constituent_id", "fiscal_year")),
+    dup_keys(giving_year, c("constituent_id", "fiscal_year")),
+    dup_keys(campaign_fy, c("constituent_id", "fiscal_year")),
+    dup_keys(passport_fy, c("constituent_id", "fiscal_year")),
+    dup_keys(existence, "constituent_id"),
+    dup_keys(individuals, "constituent_id"),
+    dup_keys(dev_panel, c("constituent_id", "fiscal_year"))
+  )
+)
+
+key_checks |>
+  gt() |>
+  tab_header(
+    title = "Key Uniqueness Checks",
+    subtitle = "Duplicate keys across source and development tables"
+  ) |>
+  cols_label(
+    table = "Table",
+    rows = "Rows",
+    duplicate_keys = "Duplicate Keys"
+  ) |>
+  fmt_number(
+    columns = c(rows, duplicate_keys),
+    decimals = 0
+  )
+```
+
+```{r}
+join_log |>
+  mutate(
+    rows_changed_vs_grid = rows != first(rows)
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Development Panel Join Verification",
+    subtitle = "Checking row preservation across data joins"
+  ) |>
+  cols_label(
+    rows = "Rows",
+    rows_changed_vs_grid = "Rows Changed"
+  ) |>
+  fmt_number(
+    columns = rows,
+    decimals = 0
+  )
+```
+
+### Eligible Rows, Positives, and Subgroups
+
+```{r}
+summarise_target <- function(df) {
+  df |>
+    summarise(
+      eligible_rows = n(),
+      positives = sum(major_donor_next_fy),
+      positive_rate = mean(major_donor_next_fy),
+      .groups = "drop"
+    )
+}
+
+by_year <- dev_panel |>
+  group_by(
+    fiscal_year,
+    outcome_year = fiscal_year + 1L
+  ) |>
+  summarise_target()
+
+by_year |>
+  gt() |>
+  tab_header(
+    title = "Development Panel Summary by Fiscal Year",
+    subtitle = "Eligible constituents and major-donor conversions"
+  ) |>
+  cols_label(
+    fiscal_year = "Feature FY",
+    outcome_year = "Outcome FY",
+    eligible_rows = "Eligible Constituents",
+    positives = "Conversions",
+    positive_rate = "Conversion Rate"
+  ) |>
+  fmt_number(
+    columns = c(eligible_rows, positives),
+    decimals = 0
+  ) |>
+  fmt_percent(
+    columns = positive_rate,
+    decimals = 3
+  )
+```
+
+### Passport Coverage and Predictor Missingness
+
+```{r}
+# Passport coverage by year and subgroup.
+dev_panel |>
+  group_by(fiscal_year, group = if_else(current_donor == 1, "current donor", "zero giving")) |>
+  summarise(
+    rows = n(),
+    passport_rows = sum(passport_recorded),
+    coverage = percent(mean(passport_recorded), accuracy = 0.1),
+    .groups = "drop"
+  ) |>
+  gt()
+```
+
+```{r}
+# Predictor missingness. Passport missingness is structural (no record), prior-year
+# giving and solicitation values are unknown for FY2021 by design, and response rates
+# are undefined when there were no solicitations.
+predictor_block <- function(p) feature_inventory$block[match(p, feature_inventory$feature)]
+
+missingness <- tibble(feature = predictor_columns) |>
+  mutate(
+    block = predictor_block(feature),
+    n_missing = map_int(feature, \(p) sum(is.na(dev_panel[[p]]))),
+    pct_missing = round(n_missing / nrow(dev_panel), 4)
+  )
+
+missingness |>
+  filter(n_missing > 0) |>
+  gt()
+```
+
+```{r}
+tibble(
+  predictors_with_no_missing_values = sum(missingness$n_missing == 0),
+  predictors_with_missing_values = sum(missingness$n_missing > 0)
+) |>
+gt()
+```
+
+```{r}
+# Missingness by year for the predictors that have any.
+dev_panel |>
+  group_by(fiscal_year) |>
+  summarise(
+    across(all_of(filter(missingness, n_missing > 0)$feature), \(x) round(mean(is.na(x)), 3)),
+    .groups = "drop"
+  ) |>
+  gt()
+```
+
+Missing Passport measures are `NA` exactly when `passport_recorded` = 0. The check below confirms there is no row with a recorded Passport state but a missing measure, and none with a measure but no recorded state.
+
+```{r}
+dev_panel |>
+  summarise(
+    recorded_but_measure_missing = sum(passport_recorded == 1 & is.na(total_titles_viewed)),
+    not_recorded_but_measure_present = sum(passport_recorded == 0 & !is.na(total_titles_viewed)),
+    not_recorded_measures_all_missing = all(is.na(total_titles_viewed[passport_recorded == 0]) &
+                                              is.na(genres_viewed[passport_recorded == 0]) &
+                                              is.na(weighted_mean_percent_watched[passport_recorded == 0])),
+    minimum_titles_when_recorded = min(total_titles_viewed, na.rm = TRUE)
+  ) |>
+  gt()
+```
+
+### Predictor Timing and Outcome-Column Exclusion
+
+```{r}
+snapshot_terms <- c(
+  "^age$", "sustainer", "annual_giving_group", "major_donor_class", "primary_constituent_type",
+  "constituent_type", "lifetime_", "previous_fy", "prospect_committed", "^gender$", "marital"
+)
+non_predictor_columns <- c(id_columns, eligibility_column, subgroup_column, audit_columns, outcome_columns)
+
+outcome_years_used <- sort(unique(dev_panel$fiscal_year + 1L))
+
+timing_checks <- tribble(
+  ~check, ~passed,
+  "Feature years are exactly FY2021-FY2024",
+    setequal(
+      unique(dev_panel$fiscal_year),
+      feature_years
+    ),
+
+  "Outcome years are exactly FY2022-FY2025; no FY2025 feature rows or FY2026 outcomes",
+    setequal(
+      outcome_years_used,
+      outcome_years
+    ) &&
+      !any(dev_panel$fiscal_year >= 2025),
+  "No source aggregate contains a fiscal year after FY2025",
+    max(giving_year$fiscal_year, campaign_fy$fiscal_year, passport_fy$fiscal_year) <= last_source_fy,
+  "No predictor is an identifier, audit field, eligibility field, subgroup flag, or outcome column",
+    length(intersect(predictor_columns, non_predictor_columns)) == 0,
+  "No predictor name starts with next_ or is the target",
+    !any(startsWith(predictor_columns, "next_")) && !("major_donor_next_fy" %in% predictor_columns),
+  "No predictor name matches a snapshot or constituent-attribute field",
+    !any(map_lgl(predictor_columns, \(p) any(str_detect(p, snapshot_terms)))),
+  "Every dev_panel column is a declared identifier, predictor, audit, eligibility, subgroup, or outcome column",
+    setequal(names(dev_panel), c(non_predictor_columns, predictor_columns)),
+  "Every predictor is in the feature inventory, and the inventory lists no other feature",
+    setequal(feature_inventory$feature, predictor_columns),
+  "Every eligible row has existence established by its feature year",
+    all(dev_panel$first_activity_fy <= dev_panel$fiscal_year),
+  "Every eligible row has current recognized giving > $0 and < $1,200",
+    all(
+      dev_panel$recognized_amount > 0 &
+      dev_panel$recognized_amount < major_threshold
+    ),
+  "The target equals next-year recognized giving >= $1,200 (exactly $1,200 is positive)",
+    all(dev_panel$major_donor_next_fy == as.integer(dev_panel$next_recognized_amount >= major_threshold)),
+  "No organization or SYN-ORPHAN record in the panel",
+    !any(dev_panel$constituent_id %in% c(excluded_constituents$constituent_id, "SYN-ORPHAN")),
+  "Prior-modern-year history is unknown (NA) for every FY2021 row",
+    all(is.na(dev_panel$prior_recognized_amount[dev_panel$fiscal_year == 2021])) &&
+      all(is.na(dev_panel$trailing_three_year_slope[dev_panel$fiscal_year == 2021])),
+  "Prior-year solicitation features are NA for every FY2021 row and observed afterward",
+    all(is.na(dev_panel$prior_fy_solicitations[dev_panel$fiscal_year == 2021])) &&
+      all(is.na(dev_panel$prior_fy_campaign_responses[dev_panel$fiscal_year == 2021])) &&
+      !any(is.na(dev_panel$prior_fy_solicitations[dev_panel$fiscal_year > 2021])) &&
+      !any(is.na(dev_panel$prior_fy_campaign_responses[dev_panel$fiscal_year > 2021])),
+  "Trailing solicitation totals cover one observed year in FY2021 and two in FY2022",
+    all(dev_panel$trailing_3_fy_solicitations[dev_panel$fiscal_year == 2021] ==
+          dev_panel$solicitations[dev_panel$fiscal_year == 2021]) &&
+      all(dev_panel$trailing_3_fy_solicitations[dev_panel$fiscal_year == 2022] ==
+            dev_panel$solicitations[dev_panel$fiscal_year == 2022] +
+            dev_panel$prior_fy_solicitations[dev_panel$fiscal_year == 2022]),
+  "Every predictor is uniquely represented in the feature inventory",
+    setequal(feature_inventory$feature, predictor_columns) &&
+    !anyDuplicated(feature_inventory$feature) &&
+    !anyDuplicated(predictor_columns),
+  "All 23 solicitation predictors are included",
+    length(solicitation_features) == 23 &&
+    all(solicitation_features %in% predictor_columns) &&
+    all(solicitation_features %in% names(dev_panel)),
+)
+
+timing_checks |>
+  mutate(status = if_else(passed, "PASS", "FAIL")) |>
+  select(check, status) |>
+  gt() |>
+  tab_header(
+    title = "Predictor Timing and Outcome Exclusion Checks"
+  ) |>
+  cols_label(
+    check = "Verification Check",
+    status = "Status"
+  )
+```
+
+### Independent Recomputation and Outcome-Year Completeness
+
+A random sample of 2,000 eligible constituent-year observations is independently recomputed from the annual giving table to verify the benchmark predictors, prior-year giving, and next-year recognized giving. Payment records are also examined to assess monthly coverage for the outcome years.
+
+```{r}
+# ============================================================
+# Independent Recalculation of Development Panel Features
+# ============================================================
+
+set.seed(5827)
+
+audit_rows <- dev_panel |>
+  slice_sample(n = min(2000, nrow(dev_panel))) |>
+  select(
+    constituent_id,
+    fiscal_year,
+    log_current_giving,
+    log_peak_annual_giving,
+    active_giving_years,
+    any_soft_credit_to_date,
+    prior_recognized_amount,
+    next_recognized_amount
+  )
+
+# Recompute values directly from annual giving records
+recomputed <- audit_rows |>
+  select(constituent_id, fiscal_year) |>
+  left_join(
+    giving_year |>
+      select(
+        constituent_id,
+        gy = fiscal_year,
+        recognized_amount,
+        soft_amount
+      ),
+    by = "constituent_id",
+    relationship = "many-to-many"
+  ) |>
+  group_by(constituent_id, fiscal_year) |>
+  summarise(
+    r_log_current = log1p(
+      sum(recognized_amount[!is.na(gy) & gy == fiscal_year])
+    ),
+
+    r_log_peak = log1p(
+      max(c(0, recognized_amount[!is.na(gy) & gy <= fiscal_year]))
+    ),
+
+    r_active = sum(
+      !is.na(gy) & gy <= fiscal_year & recognized_amount > 0
+    ),
+
+    r_any_soft = as.integer(
+      any(!is.na(gy) & gy <= fiscal_year & soft_amount > 0)
+    ),
+
+    r_prior = if_else(
+      first(fiscal_year) == first_modern_fy,
+      NA_real_,
+      sum(recognized_amount[!is.na(gy) & gy == fiscal_year - 1L])
+    ),
+
+    r_next = sum(
+      recognized_amount[!is.na(gy) & gy == fiscal_year + 1L]
+    ),
+
+    .groups = "drop"
+  )
+
+# Compare panel values against independently recomputed values
+audit_compare <- audit_rows |>
+  inner_join(
+    recomputed,
+    by = c("constituent_id", "fiscal_year")
+  )
+
+audit_results <- tibble(
+  check = c(
+    "Log Current Giving",
+    "Log Peak Annual Giving",
+    "Active Giving Years",
+    "Any Soft Credit to Date",
+    "Prior Recognized Giving",
+    "Next-Year Recognized Giving"
+  ),
+
+  passed = c(
+    isTRUE(all.equal(
+      audit_compare$log_current_giving,
+      audit_compare$r_log_current
+    )),
+
+    isTRUE(all.equal(
+      audit_compare$log_peak_annual_giving,
+      audit_compare$r_log_peak
+    )),
+
+    all(
+      audit_compare$active_giving_years == audit_compare$r_active
+    ),
+
+    all(
+      audit_compare$any_soft_credit_to_date == audit_compare$r_any_soft
+    ),
+
+    isTRUE(all.equal(
+      audit_compare$prior_recognized_amount,
+      audit_compare$r_prior
+    )),
+
+    isTRUE(all.equal(
+      audit_compare$next_recognized_amount,
+      audit_compare$r_next
+    ))
+  )
+)
+
+audit_results |>
+  mutate(status = if_else(passed, "PASS", "FAIL")) |>
+  select(check, status) |>
+  gt() |>
+  tab_header(
+    title = "Independent Feature Recalculation",
+    subtitle = paste(
+      comma(nrow(audit_compare)),
+      "sampled constituent-year observations"
+    )
+  ) |>
+  cols_label(
+    check = "Verification Check",
+    status = "Status"
+  )
+```
+
+```{r}
+# ============================================================
+# Verify Monthly Payment Coverage
+# ============================================================
+
+outcome_completeness <- q(r"---(
+SELECT
+    fy(credit_date)::INTEGER AS fiscal_year,
+    COUNT(*) AS payment_rows,
+    COUNT(
+        DISTINCT date_trunc(
+            'month',
+            TRY_CAST(credit_date AS DATE)
+        )
+    ) AS months_present
+FROM payments_dedup
+WHERE fy(credit_date) BETWEEN 2021 AND 2025
+GROUP BY 1
+ORDER BY 1
+)---") |>
+  mutate(
+    is_outcome_year = fiscal_year %in% outcome_years
+  )
+
+outcome_completeness |>
+  gt() |>
+  tab_header(
+    title = "Outcome-Year Payment Coverage",
+    subtitle = "Monthly coverage of recorded payment activity"
+  ) |>
+  cols_label(
+    fiscal_year = "Fiscal Year",
+    payment_rows = "Payment Records",
+    months_present = "Months Present",
+    is_outcome_year = "Outcome Year"
+  ) |>
+  fmt_number(
+    columns = payment_rows,
+    decimals = 0
+  )
+```
+
+### Limited Giving History in Early Years
+
+```{r}
+# ============================================================
+# Limited Giving History in Early Years
+# ============================================================
+
+giving_history_summary <- dev_panel |>
+  group_by(fiscal_year) |>
+  summarise(
+    modern_years_observed =
+      first(fiscal_year) - first_modern_fy + 1L,
+
+    rows = n(),
+
+    share_no_active_giving_years =
+      mean(active_giving_years == 0),
+
+    share_with_linked_legacy_gift =
+      mean(!is.na(legacy_last_gift_fy)),
+
+    share_no_prior_gift_known =
+      mean(no_prior_gift_known == 1),
+
+    share_prior_year_unknown =
+      mean(is.na(prior_recognized_amount)),
+
+    share_prior_year_solicitation_unknown =
+      mean(is.na(prior_fy_solicitations)),
+
+    years_in_trailing_solicitation_window =
+      min(first(fiscal_year) - first_modern_fy + 1L, 3L),
+
+    .groups = "drop"
+  )
+
+giving_history_summary |>
+  gt() |>
+  tab_header(
+    title = "Limited Giving History in Early Years",
+    subtitle = "Historical coverage by development fiscal year"
+  ) |>
+  cols_label(
+    fiscal_year = "Fiscal Year",
+    modern_years_observed = "Modern Years Observed",
+    rows = "Eligible Rows",
+    share_no_active_giving_years = "No Active Giving Years",
+    share_with_linked_legacy_gift = "Linked Legacy Gift",
+    share_no_prior_gift_known = "No Prior Gift Known",
+    share_prior_year_unknown = "Prior-Year Giving Unknown",
+    share_prior_year_solicitation_unknown = "Prior-Year Solicitation Unknown",
+    years_in_trailing_solicitation_window = "Years in Solicitation Window"
+  ) |>
+  fmt_number(
+    columns = rows,
+    decimals = 0
+  ) |>
+  fmt_percent(
+    columns = starts_with("share_"),
+    decimals = 1
+  )
+```
+
+The development panel contains 128,033 eligible constituent-year observations across FY2021–FY2024. Because eligibility requires positive recognized giving below the $1,200 major-donor threshold, all observations have at least one active giving year.
+
+Historical data availability varies across development years. FY2021 observations lack prior-year giving and solicitation history because the modern data begins in FY2021. These variables become available beginning in FY2022, while the trailing solicitation window reaches its full three-year length in FY2023.
+
+Legacy household records provide additional historical context, with linked legacy gifts available for 76.3% of eligible observations in FY2021 and 54.7% in FY2024. However, these records do not provide complete annual giving histories.
+
+These differences in historical coverage should be considered when interpreting model performance across development years.
+
+## Evaluation Metrics
+
+**Average precision** is the working primary metric. For a set of scores, it is the sum over distinct score thresholds of the increase in recall times the precision at that threshold. Rows with identical scores are handled together, so tied or constant scores do not create a spurious ordering. For a constant score it equals the event prevalence, the no-skill value.
+
+**Trapezoidal PR AUC** is a different quantity: the area under the precision-recall curve using straight-line (trapezoid) interpolation. With tied or constant scores it can be a degenerate-curve artifact. It is **kept distinct** and may be reported only as a labeled diagnostic. The toy example below shows how the two differ on a constant score (no model involved).
+
+```{r}
+library(yardstick)
+
+# Create example dataset
+toy <- tibble(
+  truth = factor(
+    c(rep("yes", 3), rep("no", 997)),
+    levels = c("yes", "no")
+  ),
+  constant_score = 0.01,
+  informative_score = c(
+    0.9, 0.5, 0.2,
+    seq(0.45, 0, length.out = 997)
+  )
+)
+
+# Calculate evaluation metrics
+metric_comparison <- map_dfr(
+  c("constant_score", "informative_score"),
+  \(col) {
+    tibble(
+      score = col,
+      prevalence = mean(toy$truth == "yes"),
+      average_precision = average_precision(
+        toy, truth, all_of(col)
+      )$.estimate,
+      pr_auc_trapezoidal = pr_auc(
+        toy, truth, all_of(col)
+      )$.estimate
+    )
+  }
+)
+
+# Display formatted table
+metric_comparison |>
+  mutate(
+    score = recode(
+      score,
+      constant_score = "Constant Score",
+      informative_score = "Informative Score"
+    )
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Average Precision vs. Trapezoidal PR AUC",
+    subtitle = "Illustrative comparison using 1,000 observations"
+  ) |>
+  cols_label(
+    score = "Prediction Scores",
+    prevalence = "Event Prevalence",
+    average_precision = "Average Precision",
+    pr_auc_trapezoidal = "Trapezoidal PR AUC"
+  ) |>
+  fmt_percent(
+    columns = c(
+      prevalence,
+      average_precision,
+      pr_auc_trapezoidal
+    ),
+    decimals = 1
+  )
+```
+
+## Development Evaluation Protocol
+
+This protocol is established **before model training** and governs the development comparison of candidate algorithms and feature configurations.
+
+The objective is to identify the algorithm and predictor combination that most effectively predicts whether a constituent with recognized giving greater than $0 and less than $1,200 in a feature fiscal year will reach the $1,200 major-donor threshold in the following fiscal year.
+
+Five classification algorithms will be evaluated: Logistic Regression, Decision Tree, Random Forest, Elastic Net, and XGBoost. Each algorithm will be evaluated across six predictor configurations, producing 30 algorithm-feature combinations.
+
+Development modeling uses FY2021–FY2024 feature-year observations and their corresponding following-year outcomes. FY2025 feature-year observations and FY2026 outcomes are reserved for independent final evaluation and will not influence model selection, hyperparameter tuning, or preprocessing decisions.
+
+### Folds
+
+**Folds (Expanding Windows, by Feature Year)**
+
+| Fold | Training Feature Years | Validation Feature Year | Validation Outcome Year |
+|:--:|:--|:--:|:--:|
+| 1 | FY2021 | FY2022 | FY2023 |
+| 2 | FY2021–FY2022 | FY2023 | FY2024 |
+| 3 | FY2021–FY2023 | FY2024 | FY2025 |
+
+Every validation year follows its training years. All training outcomes are observed by the beginning of the corresponding validation feature year, preventing future outcome information from entering model training.
+
+### Scoring and Aggregation
+
+The complete eligible validation population of each fold will be scored without sampling, negative subsampling, or outcome reweighting.
+
+Each fold will be evaluated separately, and performance will also be summarized using the unweighted mean across all three folds. This gives each validation year equal importance regardless of the number of observations or positive outcomes.
+
+A constant-probability baseline will assign each validation observation the observed conversion prevalence of its corresponding training fold.
+
+### Metrics
+
+The primary evaluation metric is **average precision**, calculated as the sum of the increase in recall multiplied by precision at each distinct prediction-score threshold, with tied scores handled together.
+
+Average precision is distinguished from trapezoidal precision-recall AUC, which will not be used for model selection.
+
+Secondary evaluation metrics include ROC AUC, Brier score, log loss, and tie-aware precision, recall, lift, and expected positive outcomes captured among the top 100 and top 500 ranked constituents.
+
+Lift is calculated as precision within the ranked group divided by the overall validation prevalence.
+
+**Tie-Aware Top-K Evaluation.** All observations scoring above the cutoff are included. Remaining positions are allocated proportionally among observations tied at the cutoff, ensuring that the expected number of positive outcomes does not depend on arbitrary row ordering.
+
+For a constant prediction score, every observation is tied, producing an expected lift of 1.
+
+### Hyperparameter Tuning
+
+Hyperparameter grids will be declared before model fitting and applied consistently across feature configurations.
+
+Hyperparameter selection will use chronological development data only. Where sufficient prior years are available, candidate settings will be evaluated using expanding-window inner validation within the outer training period.
+
+Because the first development fold contains only FY2021 training observations, chronological inner validation is unavailable for that fold. Prespecified hyperparameter settings will therefore be used for its evaluation.
+
+All preprocessing operations requiring estimated parameters, including imputation and standardization, will be fitted using training observations only and subsequently applied to validation observations.
+
+```{r}
+# ============================================================
+# Declared Model Hyperparameter Grids
+# ============================================================
+
+# Reproducibility
+model_seed <- 42L
+
+# Logistic Regression
+logistic_grid <- tibble(
+  model = "Logistic Regression"
+)
+
+# Decision Tree
+tree_grid <- expand_grid(
+  cp = c(0.00001, 0.0001, 0.001),
+  minbucket = c(25L, 100L),
+  maxdepth = 6L
+)
+
+# Random Forest
+# mtry will be calculated separately for each feature
+# configuration because the number of predictors varies.
+rf_grid <- expand_grid(
+  mtry_fraction = c(0.25, 0.50, 0.75),
+  min.node.size = c(5L, 20L),
+  num.trees = 500L
+)
+
+# Elastic Net
+elastic_net_grid <- expand_grid(
+  alpha = c(0, 0.25, 0.50, 0.75, 1),
+  lambda = c(0.001, 0.01, 0.1)
+)
+
+# XGBoost
+xgb_grid <- expand_grid(
+  max_depth = c(3L, 5L),
+  eta = c(0.05, 0.10),
+  min_child_weight = c(1, 5),
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  nrounds = c(100L, 300L)
+)
+
+# Display grid sizes
+tibble(
+  algorithm = c(
+    "Logistic Regression",
+    "Decision Tree",
+    "Random Forest",
+    "Elastic Net",
+    "XGBoost"
+  ),
+  grid_combinations = c(
+    nrow(logistic_grid),
+    nrow(tree_grid),
+    nrow(rf_grid),
+    nrow(elastic_net_grid),
+    nrow(xgb_grid)
+  )
+) |>
+  gt() |>
+  tab_header(
+    title = "Declared Model Hyperparameter Grids"
+  ) |>
+  cols_label(
+    algorithm = "Algorithm",
+    grid_combinations = "Hyperparameter Combinations"
+  )
+```
+
+### Model Selection and Limitations
+
+Five classification algorithms will be compared across six feature configurations, producing 30 candidate combinations.
+
+The primary model-selection criterion will be mean development average precision across the three expanding-window validation folds.
+
+Secondary metrics will be used to assess discrimination, probability calibration, and fundraising prospect prioritization.
+
+Only models producing valid predictions across all three development folds will qualify for the primary comparison. Failed or incomplete fits will be documented and excluded from model-selection rankings.
+
+Because the development results are used to select the algorithm, feature configuration, and hyperparameters, the selected model's development performance may be optimistic and should not be interpreted as an independent estimate of future performance.
+
+Small differences in average precision will not automatically be interpreted as meaningful improvements. Fold-level consistency, model complexity, calibration, and operational usefulness will also be considered.
+
+After development model selection is complete, the selected configuration will be refitted using all FY2021–FY2024 development observations and evaluated once against FY2025 feature-year observations and FY2026 outcomes.
+
+The FY2026 evaluation will provide the independent final performance estimate, provided the held-out outcomes have not influenced model development.
+
+## Modeling
+
+### Model Development
+
+Our objective is to compare five classification algorithms across six predictor configurations, using average precision as the primary selection metric.
+
+The development dataset contains constituents with recognized giving greater than $0 and less than $1,200 in the feature fiscal year. The target is whether they reach at least $1,200 in recognized giving during the following fiscal year.
+
+#### Define Feature Configurations
+
+```{r}
+# ============================================================
+# Feature Configurations
+# ============================================================
+
+feature_configs <- list(
+  A = benchmark_predictors,
+  B = c(benchmark_predictors, giving_history_candidates),
+  C = c(benchmark_predictors, solicitation_features),
+  D = c(benchmark_predictors, passport_features),
+  E = c(
+    benchmark_predictors,
+    giving_history_candidates,
+    solicitation_features
+  ),
+  F = c(
+    benchmark_predictors,
+    giving_history_candidates,
+    solicitation_features,
+    passport_features
+  )
+)
+
+config_labels <- c(
+  A = "Benchmark",
+  B = "Benchmark + Giving History",
+  C = "Benchmark + Solicitation",
+  D = "Benchmark + Passport",
+  E = "Benchmark + Giving History + Solicitation",
+  F = "All Predictors"
+)
+
+stopifnot(
+  lengths(feature_configs) ==
+    c(A = 4L, B = 24L, C = 27L, D = 8L, E = 47L, F = 51L)
+)
+
+stopifnot(
+  all(unlist(feature_configs) %in% names(dev_panel))
+)
+```
+
+#### Define Modeling Packages
+
+```{r}
+# ============================================================
+# Modeling Packages
+# ============================================================
+
+library(tidyverse)
+library(tidymodels)
+library(glmnet)
+library(rpart)
+library(ranger)
+library(xgboost)
+library(gt)
+
+set.seed(42)
+```
+
+### Shared Preprocessing
+
+```{r}
+# ============================================================
+# Predictor Transformation Groups
+# ============================================================
+
+# Nonnegative dollar amounts and counts
+log1p_predictors <- c(
+  # Giving History
+  "direct_amount",
+  "soft_amount",
+  "direct_payment_count",
+  "soft_credit_count",
+  "prior_recognized_amount",
+  "peak_annual_giving_to_date",
+  "cumulative_direct_amount",
+  "cumulative_soft_amount",
+  "cumulative_recognized_amount",
+  "cumulative_direct_payment_count",
+  "cumulative_soft_credit_count",
+  "cumulative_gift_count",
+  "average_gifts_per_active_year",
+  "average_recognized_per_active_year",
+
+  # Solicitation
+  "trailing_3_fy_solicitations",
+  "solicitations_digital",
+  "prior_fy_solicitations",
+  "solicitations",
+  "solicitations_miscellaneous",
+  "trailing_3_fy_campaign_responses",
+  "unique_campaigns_solicited",
+  "campaign_codes_linked",
+  "responses_miscellaneous",
+  "solicitations_mail",
+  "solicitations_email",
+  "prior_fy_campaign_responses",
+  "campaign_responses",
+  "solicitations_phone",
+  "solicitations_in_person",
+  "responses_mail",
+  "responses_phone",
+  "responses_email",
+  "responses_digital",
+  "responses_in_person",
+
+  # Passport
+  "total_titles_viewed",
+  "genres_viewed"
+)
+
+# Variables that can contain negative values
+signed_log_predictors <- c(
+  "yoy_change",
+  "trailing_three_year_slope"
+)
+
+# Verify all transformation variables exist
+stopifnot(
+  all(log1p_predictors %in% names(dev_panel)),
+  all(signed_log_predictors %in% names(dev_panel)),
+  !any(log1p_predictors %in% signed_log_predictors),
+  !anyDuplicated(log1p_predictors),
+  !anyDuplicated(signed_log_predictors)
+)
+
+# Confirm log1p variables contain no negative values
+stopifnot(
+  all(
+    vapply(
+      log1p_predictors,
+      function(p) {
+        all(dev_panel[[p]] >= 0, na.rm = TRUE)
+      },
+      logical(1)
+    )
+  )
+)
+
+# Confirm all 51 predictors are accounted for
+all_predictors <- unique(unlist(feature_configs))
+
+stopifnot(
+  length(all_predictors) == 51,
+  all(c(log1p_predictors, signed_log_predictors) %in%
+        all_predictors)
+)
+```
+
+```{r}
+# ============================================================
+# Shared Preprocessing Recipe
+# ============================================================
+
+create_model_recipe <- function(train_data, predictors) {
+
+  model_data <- train_data |>
+    select(major_donor_next_fy, all_of(predictors)) |>
+    mutate(
+      major_donor_next_fy = factor(
+        if_else(major_donor_next_fy == 1, "yes", "no"),
+        levels = c("yes", "no")
+      )
+    )
+
+  log_vars <- intersect(predictors, log1p_predictors)
+  signed_vars <- intersect(predictors, signed_log_predictors)
+
+  rec <- recipe(major_donor_next_fy ~ ., data = model_data)
+
+  if (length(log_vars) > 0) {
+    rec <- rec |>
+      step_log(
+        all_of(log_vars),
+        offset = 1
+      )
+  }
+
+  if (length(signed_vars) > 0) {
+    rec <- rec |>
+      step_mutate_at(
+        all_of(signed_vars),
+        fn = ~ sign(.x) * log1p(abs(.x))
+      )
+  }
+
+  rec |>
+    step_string2factor(all_nominal_predictors()) |>
+    step_unknown(all_nominal_predictors()) |>
+    step_novel(all_nominal_predictors()) |>
+    step_impute_median(all_numeric_predictors()) |>
+    step_dummy(all_nominal_predictors()) |>
+    step_zv(all_predictors()) |>
+    step_normalize(all_numeric_predictors())
+}
+```
+
+### Define the Algorithms
+
+```{r}
+# ============================================================
+# Model Specifications
+# ============================================================
+
+# Logistic Regression
+logistic_spec <- logistic_reg(
+  mode = "classification"
+) |>
+  set_engine("glm")
+
+
+# Decision Tree
+tree_spec <- decision_tree(
+  cost_complexity = tune(),
+  min_n = tune(),
+  tree_depth = 6
+) |>
+  set_engine("rpart") |>
+  set_mode("classification")
+
+
+# Random Forest
+rf_spec <- rand_forest(
+  mtry = tune(),
+  min_n = tune(),
+  trees = 500
+) |>
+  set_engine(
+    "ranger",
+    probability = TRUE,
+    importance = "permutation"
+  ) |>
+  set_mode("classification")
+
+
+# Elastic Net
+elastic_net_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = tune()
+) |>
+  set_engine("glmnet") |>
+  set_mode("classification")
+
+
+# XGBoost
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune(),
+  sample_size = 0.8,
+  mtry = tune()
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+```
+
+### Verify One Training and Validation Fold
+
+```{r}
+# ============================================================
+# Expanding-Window Development Folds
+# ============================================================
+
+folds <- tibble(
+  fold = 1:3,
+  training_years = c(
+    "FY2021",
+    "FY2021–FY2022",
+    "FY2021–FY2023"
+  ),
+  validation_year = 2022:2024
+)
+
+# Retrieve training and validation data for a given fold
+fold_rows <- function(fold) {
+
+  validation_year <- folds$validation_year[
+    folds$fold == fold
+  ]
+
+  if (length(validation_year) != 1) {
+    stop("Invalid fold number.")
+  }
+
+  list(
+    train = dev_panel |>
+      filter(fiscal_year < validation_year),
+
+    valid = dev_panel |>
+      filter(fiscal_year == validation_year)
+  )
+}
+```
+
+```{r}
+# ============================================================
+# Verify First Development Fold
+# ============================================================
+
+fold_1 <- fold_rows(1L)
+
+train_data <- fold_1$train
+valid_data <- fold_1$valid
+
+baseline_recipe <- create_model_recipe(
+  train_data,
+  feature_configs$A
+)
+
+prepared_recipe <- prep(
+  baseline_recipe,
+  training = train_data
+)
+
+train_processed <- bake(
+  prepared_recipe,
+  new_data = train_data |>
+    select(major_donor_next_fy, all_of(feature_configs$A))
+)
+
+valid_processed <- bake(
+  prepared_recipe,
+  new_data = valid_data |>
+    select(major_donor_next_fy, all_of(feature_configs$A))
+)
+
+stopifnot(
+  nrow(train_processed) == nrow(train_data),
+  nrow(valid_processed) == nrow(valid_data),
+  identical(names(train_processed), names(valid_processed))
+)
+
+tibble(
+  dataset = c("Training", "Validation"),
+  observations = c(
+    nrow(train_processed),
+    nrow(valid_processed)
+  ),
+  predictors = c(
+    ncol(train_processed) - 1,
+    ncol(valid_processed) - 1
+  ),
+  positive_outcomes = c(
+    sum(train_processed$major_donor_next_fy == "yes"),
+    sum(valid_processed$major_donor_next_fy == "yes")
+  )
+) |>
+  gt() |>
+  tab_header(
+    title = "First Development Fold Verification",
+    subtitle = "Benchmark predictor configuration"
+  ) |>
+  fmt_number(
+    columns = c(
+      observations,
+      predictors,
+      positive_outcomes
+    ),
+    decimals = 0
   )
 ```
