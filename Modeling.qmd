@@ -40,6 +40,7 @@ library(here)
 library(scales)
 library(gt)
 library(lubridate)
+library(patchwork)
 
 major_threshold <- 1200
 feature_years <- 2021:2024
@@ -156,7 +157,6 @@ existence <- existence_sources |>
       na.rm = TRUE
     )
   )
-
 ```
 
 #### Eligible Constituent-Year Panel
@@ -462,21 +462,24 @@ giving_contribution_summary <- historical_totals |>
   )
 
 giving_contribution_summary |>
+  select(
+    giving_group,
+    share_of_conversions,
+    share_of_recognized_giving,
+    share_of_direct_giving
+  ) |>
   gt() |>
   tab_header(title = "Share of Historical Major-Donor Outcomes") |>
   cols_label(
-    giving_group = "Giving group",
-    total_conversions = "Conversions",
-    total_recognized_giving = "Recognized giving",
-    total_direct_giving = "Direct giving",
-    share_of_conversions = "Share of conversions",
-    share_of_recognized_giving = "Share of recognized",
-    share_of_direct_giving = "Share of direct"
+    giving_group = "Giving Group",
+    share_of_conversions = "Share of Conversions",
+    share_of_recognized_giving = "Share of Recognized Giving",
+    share_of_direct_giving = "Share of Direct Giving"
   ) |>
-  fmt_number(columns = total_conversions, decimals = 0) |>
-  fmt_currency(columns = c(total_recognized_giving, total_direct_giving),
-               currency = "USD", decimals = 2) |>
-  fmt_percent(columns = starts_with("share_"), decimals = 2)
+  fmt_percent(
+    columns = starts_with("share_"),
+    decimals = 2
+  )
 ```
 
 ### Prospect Pool Summary
@@ -494,7 +497,7 @@ dbDisconnect(con, shutdown = TRUE)
 
 **Question:** Do the 4 baseline predictors perform better for all eligible prospects or for eligible prospects who gave more than $0 in the **current** fiscal year?
 
-Both populations are compared with the same four group-model benchmark predictors using all three expanding-window validation folds. Each validation fold retains the actual population prevalence. Training retains all positives and samples up to 50 negatives per positive. The population decision considers both average precision and how many future conversions remain eligible.
+Both populations are compared using the same four group-model benchmark predictors across two expanding-window chronological validation folds. Each fold uses at least two fiscal years of training data, with FY2023 and FY2024 serving as validation feature years. Training retains all positives and samples up to 50 negatives per positive. The population decision considers both average precision and how many future conversions remain eligible.
 
 ```{r modeling_setup}
 library(caret)
@@ -555,10 +558,10 @@ dev <- dev_panel |>
 
 ```{r folds}
 folds <- tibble(
-  fold = 1:3,
-  training_years = c("2021", "2021-2022", "2021-2023"),
-  feature_year = 2022:2024,
-  outcome_year = 2023:2025
+  fold = 1:2,
+  training_years = c("2021-2022", "2021-2023"),
+  feature_year = 2023:2024,
+  outcome_year = 2024:2025
 )
 
 gt(folds)
@@ -844,8 +847,7 @@ baseline_predictions <- dplyr::bind_rows(lapply(seq_len(nrow(folds)), function(f
     }
 
     # Keep all positives and sample at most 50 negatives per positive.
-    set.seed(RANDOM_SEED + fold +
-             ifelse(population == "positive_current_givers", 1000L, 0L))
+    set.seed(RANDOM_SEED + fold)
     sampled_rows <- sort(c(
       positive,
       sample(negative, min(length(negative), 50L * length(positive)))
@@ -907,7 +909,7 @@ baseline_summary <- baseline_results |>
   ) |>
   arrange(desc(mean_ap))
 
-# Like-for-like comparison: both populations evaluated on all three folds.
+# Like-for-like comparison: both populations evaluated on the same two folds.
 baseline_shared_folds <- baseline_results |>
   group_by(population, model) |>
   summarise(
@@ -921,14 +923,7 @@ baseline_shared_folds <- baseline_results |>
 
 baseline_shared_folds |>
   gt() |>
-  tab_header(title = "Population Comparison: All Three Shared Folds") |>
-  fmt_number(columns = c(mean_ap, mean_roc_auc), decimals = 4) |>
-  fmt_number(columns = mean_brier, decimals = 6)
-
-# Overall summary using the same three folds per population.
-baseline_summary |>
-  gt() |>
-  tab_header(title = "Logistic Regression: Prospect Population Comparison") |>
+  tab_header(title = "Population Comparison: Two Shared Folds") |>
   fmt_number(columns = c(mean_ap, mean_roc_auc), decimals = 4) |>
   fmt_number(columns = mean_brier, decimals = 6)
 ```
@@ -961,6 +956,323 @@ baseline_coverage |>
   fmt_percent(columns = c(prospect_coverage, conversion_coverage), decimals = 2)
 ```
 
+```{r}
+coverage_summary <- baseline_coverage |>
+  summarise(
+    eligible = sum(eligible),
+    current_donors = sum(eligible_positive_current_givers),
+    total_conversions = sum(total_conversions),
+    current_conversions = sum(conversions_positive_current_givers)
+  ) |>
+  mutate(
+    zero_donors = eligible - current_donors,
+    zero_conversions = total_conversions - current_conversions,
+    prospect_coverage = current_donors / eligible,
+    conversion_coverage = current_conversions / total_conversions,
+    prospect_reduction = 1 - prospect_coverage,
+    current_conversion_rate = current_conversions / current_donors,
+    zero_conversion_rate = zero_conversions / zero_donors,
+    relative_conversion_rate = current_conversion_rate /
+      zero_conversion_rate
+  )
+```
+
+```{r}
+prospect_pool_summary <- tibble(
+  prospect_pool = c(
+    "All Eligible Constituents",
+    "Current Donors Only"
+  ),
+  eligible_observations = c(
+    coverage_summary$eligible,
+    coverage_summary$current_donors
+  ),
+  major_donor_conversions = c(
+    coverage_summary$total_conversions,
+    coverage_summary$current_conversions
+  )
+) |>
+  mutate(
+    prospect_pool_reduction = 
+      1 - eligible_observations / first(eligible_observations),
+    conversions_retained = 
+      major_donor_conversions / first(major_donor_conversions)
+  )
+
+prospect_pool_summary |>
+  gt() |>
+  tab_header(
+    title = "Impact of Restricting the Prospect Pool",
+    subtitle = "Development Data: FY2021–FY2024"
+  ) |>
+  cols_label(
+    prospect_pool = "Prospect Pool",
+    eligible_observations = "Eligible Observations",
+    major_donor_conversions = "Major Donor Conversions",
+    prospect_pool_reduction = "Prospect Pool Reduction",
+    conversions_retained = "Conversions Retained"
+  ) |>
+  fmt_number(
+    columns = c(
+      eligible_observations,
+      major_donor_conversions
+    ),
+    decimals = 0
+  ) |>
+  fmt_percent(
+    columns = c(
+      prospect_pool_reduction,
+      conversions_retained
+    ),
+    decimals = 2
+  ) |>
+  text_transform(
+    locations = cells_body(
+      columns = prospect_pool_reduction,
+      rows = prospect_pool == "All Eligible Constituents"
+    ),
+    fn = function(x) "-"
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      rows = prospect_pool == "Current Donors Only"
+    )
+  )
+```
+
+```{r prospect_coverage_visual}
+#| include: false
+
+# Aggregate coverage across development fiscal years
+coverage_summary <- baseline_coverage |>
+  summarise(
+    eligible = sum(eligible),
+    current_donors = sum(eligible_positive_current_givers),
+    total_conversions = sum(total_conversions),
+    current_conversions = sum(conversions_positive_current_givers)
+  ) |>
+  mutate(
+    zero_donors = eligible - current_donors,
+    zero_conversions = total_conversions - current_conversions,
+    prospect_coverage = current_donors / eligible,
+    conversion_coverage = current_conversions / total_conversions,
+    prospect_reduction = 1 - prospect_coverage,
+    current_conversion_rate = current_conversions / current_donors,
+    zero_conversion_rate = zero_conversions / zero_donors,
+    relative_conversion_rate = current_conversion_rate /
+      zero_conversion_rate
+  )
+
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+# Presentation colors
+current_color <- "#D9FF99"
+zero_color    <- "#45496D"
+text_color    <- "#FFFFFF"
+dark_color    <- "#20234F"
+
+# Prepare bar data
+bar_data <- tibble(
+  label = c(
+    "Eligible Observations",
+    "Major Donor Conversions"
+  ),
+  share = c(
+    coverage_summary$prospect_coverage,
+    coverage_summary$conversion_coverage
+  ),
+  y = c(3.8, 2.5)
+)
+
+# Prepare headline statistics
+stat_data <- tibble(
+  x = c(0.25, 0.75),
+  value = c(
+    percent(
+      coverage_summary$prospect_reduction,
+      accuracy = 0.1
+    ),
+    percent(
+      coverage_summary$conversion_coverage,
+      accuracy = 0.1
+    )
+  ),
+  label = c(
+    "Reduction in\nProspect Pool",
+    "Conversions\nRetained"
+  )
+)
+
+# Create visualization
+prospect_coverage_plot <- ggplot() +
+
+  # Current donor segments
+  geom_rect(
+    data = bar_data,
+    aes(
+      xmin = 0,
+      xmax = share,
+      ymin = y - 0.23,
+      ymax = y + 0.23
+    ),
+    fill = current_color
+  ) +
+
+  # Zero-giving constituent segments
+  geom_rect(
+    data = bar_data,
+    aes(
+      xmin = share,
+      xmax = 1,
+      ymin = y - 0.23,
+      ymax = y + 0.23
+    ),
+    fill = zero_color
+  ) +
+
+  # Bar headings
+  geom_text(
+    data = bar_data,
+    aes(x = 0, y = y + 0.48, label = label),
+    hjust = 0,
+    color = text_color,
+    fontface = "bold",
+    size = 4.5
+  ) +
+
+  # Current donor percentages
+  geom_text(
+    data = bar_data,
+    aes(
+      x = share / 2,
+      y = y,
+      label = percent(share, accuracy = 1)
+    ),
+    color = dark_color,
+    fontface = "bold",
+    size = 5
+  ) +
+
+  # Zero-giving percentages
+  geom_text(
+    data = bar_data,
+    aes(
+      x = share + (1 - share) / 2,
+      y = y,
+      label = percent(1 - share, accuracy = 1)
+    ),
+    color = text_color,
+    fontface = "bold",
+    size = 4.5
+  ) +
+
+  # Legend
+  annotate(
+    "point",
+    x = 0.03, y = 1.75,
+    color = current_color,
+    shape = 15,
+    size = 4
+  ) +
+  annotate(
+    "text",
+    x = 0.065, y = 1.75,
+    label = "Current Donors",
+    hjust = 0,
+    color = text_color,
+    size = 3.8
+  ) +
+  annotate(
+    "point",
+    x = 0.44, y = 1.75,
+    color = zero_color,
+    shape = 15,
+    size = 4
+  ) +
+  annotate(
+    "text",
+    x = 0.475, y = 1.75,
+    label = "Zero-Giving Constituents",
+    hjust = 0,
+    color = text_color,
+    size = 3.8
+  ) +
+
+  # Horizontal divider
+  annotate(
+    "segment",
+    x = 0, xend = 1,
+    y = 1.35, yend = 1.35,
+    color = zero_color,
+    linewidth = 0.6
+  ) +
+
+  # Headline statistics
+  geom_text(
+    data = stat_data,
+    aes(x = x, y = 0.85, label = value),
+    color = current_color,
+    fontface = "bold",
+    size = 10
+  ) +
+
+  # Statistic descriptions
+  geom_text(
+    data = stat_data,
+    aes(x = x, y = 0.20, label = label),
+    color = text_color,
+    size = 4.2,
+    lineheight = 1.05
+  ) +
+
+  # Layout
+  coord_cartesian(
+    xlim = c(-0.02, 1.02),
+    ylim = c(-0.15, 4.5),
+    expand = FALSE,
+    clip = "off"
+  ) +
+
+  theme_void() +
+
+  theme(
+    plot.background = element_rect(
+      fill = "transparent",
+      color = NA
+    ),
+    panel.background = element_rect(
+      fill = "transparent",
+      color = NA
+    ),
+    plot.margin = ggplot2::margin(5, 5, 5, 5)
+  )
+
+# Preview with presentation background
+prospect_coverage_plot +
+  theme(
+    plot.background = element_rect(
+      fill = dark_color,
+      color = NA
+    )
+  )
+```
+
+```{r}
+#| include: false
+ggsave(
+  filename = "Prospect_Pool_Coverage.png",
+  plot = prospect_coverage_plot,
+  width = 6.5,
+  height = 4,
+  units = "in",
+  dpi = 300,
+  bg = "transparent"
+)
+```
+
 ### Prospect Pool Selection
 
 ```{r}
@@ -988,11 +1300,19 @@ tibble(
   fmt_percent(columns = conversion_rate, decimals = 3)
 ```
 
-To determine the appropriate prospect population for predictive modeling, I compared two logistic regression models using the same modeling approach: one restricted to constituents with positive current-year giving and another including all eligible constituents, regardless of current-year giving activity.
+To determine the appropriate prospect population for predictive modeling, I compared two baseline logistic regression models using the same four predictors and chronological validation approach: one restricted to constituents with positive current-year giving and another including all eligible constituents, regardless of current-year giving activity.
 
-The positive-current-givers model outperformed the all-eligible model across all three evaluation metrics. Average precision increased from 0.1017 to 0.1721, representing a **69.2% relative improvement**. ROC AUC increased slightly from 0.9193 to 0.9224, while the mean Brier score decreased from 0.013476 to 0.001269.
+The positive-current-givers model achieved higher mean average precision and mean ROC AUC across the two shared validation folds. Mean average precision increased from 0.1026 to 0.1892, representing an approximately **84.41% relative improvement**, calculated as follows:
 
-Although these results favor the positive-current-givers model, average precision is influenced by the underlying conversion rate, which differs between the two prospect populations. Therefore, the comparison must also consider the proportion of future major-donor conversions retained. As demonstrated in the exploratory analysis, restricting the population to constituents with positive current-year giving reduces the eligible prospect pool by approximately 79.2% while retaining 91.3% of historically observed conversions.
+$$
+\text{Relative Improvement} =
+\frac{0.1892 - 0.1026}{0.1026} \times 100
+= 84.41\%
+$$
+
+Mean ROC AUC also increased from 0.9260 to 0.9404, while the mean Brier score increased from 0.000254 to 0.001106.
+
+Although these results favor the positive-current-givers model in terms of ranking performance, both average precision and Brier score are influenced by the underlying conversion rate, which differs between the two prospect populations. Therefore, the comparison must also consider the proportion of future major-donor conversions retained. As demonstrated in the prospect coverage analysis, restricting the population to constituents with positive current-year giving reduces the eligible prospect pool by approximately 79.2% while retaining 91.3% of historically observed conversions.
 
 Based on these findings, I selected constituents with positive current-year giving below $1,200 as the prospect population for subsequent modeling. This approach prioritizes a smaller pool of constituents with a higher observed likelihood of becoming major donors, while acknowledging that some potential conversions may be excluded.
 
@@ -1191,7 +1511,7 @@ model_summary %>%
 
 ### Highlight: Best-Performing Models
 
-This table isolates the algorithm and feature configuration with the best mean score for each evaluation metric across the three folds. Higher average precision and ROC AUC are preferred, while lower Brier score is preferred.
+This table identifies the algorithm and feature configuration with the best mean performance for each evaluation metric across the two chronological validation folds. Higher average precision and ROC AUC are preferred, while lower Brier score is preferred.
 
 ```{r best-models}
 best_models <- model_summary %>%
@@ -1221,111 +1541,14 @@ best_models %>%
   fmt_number(columns = value, decimals = 4)
 ```
 
-### Feature Importance
-
-```{r variable-importance}
-# Identify positive and negative development observations
-y_full <- modeling_data$major_donor_next_fy
-
-positive <- which(y_full == 1)
-negative <- which(y_full == 0)
-
-# Apply the same negative sampling strategy
-set.seed(RANDOM_SEED + 4)
-
-sampled_rows <- sort(c(
-  positive,
-  sample(
-    negative,
-    min(length(negative), 50L * length(positive))
-  )
-))
-
-# Prepare predictors using the full development period
-features <- prepare_features(
-  feature_sets$with_solicitation,
-  modeling_data,
-  modeling_data,
-  sampled_rows
-)
-
-# Convert predictors to matrices
-x_train <- as.matrix(features$train)
-y_train <- as.integer(y_full[sampled_rows])
-
-# Fit Elastic Net with cross-validation to select lambda
-set.seed(RANDOM_SEED)
-
-elastic_net <- glmnet::cv.glmnet(
-  x = x_train,
-  y = y_train,
-  family = "binomial",
-  alpha = 0.5,
-  nfolds = 5,
-  type.measure = "deviance",
-  standardize = TRUE
-)
-```
-
-```{r}
-# Extract Elastic Net coefficients
-importance <- as.matrix(
-  coef(elastic_net, s = "lambda.min")
-) |>
-  as.data.frame() |>
-  tibble::rownames_to_column("Feature") |>
-  rename(Coefficient = 2) |>
-  filter(Feature != "(Intercept)") |>
-  mutate(
-    Importance = abs(Coefficient),
-    Direction = if_else(
-      Coefficient > 0,
-      "Positive",
-      "Negative"
-    )
-  ) |>
-  arrange(desc(Importance))
-
-# Plot feature importance for all predictors
-ggplot(
-  importance,
-  aes(
-    x = reorder(Feature, Importance),
-    y = Importance,
-    fill = Direction
-  )
-) +
-  geom_col() +
-  coord_flip() +
-  scale_fill_manual(
-    values = c(
-      "Positive" = "#108542",
-      "Negative" = "#D9534F"
-    )
-  ) +
-  labs(
-    title = "Elastic Net Feature Importance: All Features",
-    x = NULL,
-    y = "Absolute Coefficient",
-    fill = "Association"
-  ) +
-  theme_minimal()
-```
-
-The strongest features that have a positive association with major donor conversion are `any_soft_credit_to_date`, `log_current_giving`, `log_peak_annual_giving`, `solicitations_phone`, `trailing_3_fy_response_rate`, `campaign_responses`, and `solicitations_email`.
-
-The strongest features that have a negative association with major donor conversion are `responses_miscellaneous`, `responses_email`, `responses_digital`, `solicitations_in_person`, `active_giving_years`, `prior_fy_campaign_responses`, `trailing_3_fy_campaign_responses`, `prior_fy_solicitations`, `solicitations_mail`, and `solicitations_miscellaneous`.
-
-The remaining features had coefficients near zero, suggesting that they contributed relatively little to the model's predictions after accounting for the other variables. This may reflect limited independent predictive information or overlap with other features included in the model.
-
 ### Conclusions
 
-This analysis evaluated the appropriate prospect population and the predictive value of solicitation-related features for identifying constituents likely to become major donors in the following fi+scal year.
+This analysis evaluated the appropriate prospect population and the predictive value of solicitation-related features for identifying constituents likely to become major donors in the following fiscal year.
 
-The prospect pool analysis demonstrated that constituents with positive current-year giving were substantially more likely to reach the $1,200 major-donor threshold than constituents with no recognized giving. Although restricting the population excludes some potential conversions, it substantially reduces the number of eligible prospects while retaining the majority of historically observed conversions. Based on these findings and the initial logistic regression comparison, I selected constituents with recognized giving greater than $0 but less than $1,200 in the feature fiscal year as the population for subsequent modeling.
+The prospect pool analysis demonstrated that constituents with positive current-year giving were substantially more likely to reach the $1,200 major-donor threshold than constituents with no recognized giving. Restricting the population to current donors reduced the eligible prospect pool by approximately 79.2% while retaining 91.3% of historically observed major-donor conversions. The baseline logistic regression comparison further supported this decision, with mean average precision increasing from 0.1026 to 0.1892, representing an approximately 84.41% relative improvement. Based on these findings, I selected constituents with recognized giving greater than $0 but less than $1,200 in the feature fiscal year as the population for subsequent modeling.
 
-I then evaluated whether adding 23 solicitation-related features to the four baseline predictors improved model performance. Among the models evaluated, Elastic Net with the baseline and solicitation features achieved the strongest predictive performance. The feature importance analysis also identified several meaningful associations with major-donor conversion, including prior giving activity, soft-credit history, and solicitation engagement. These findings suggest that solicitation-related information provides additional predictive value beyond the baseline giving characteristics.
+I then evaluated whether adding 23 solicitation-related features to the four baseline predictors improved model performance. Among the models evaluated, Logistic Regression without solicitation features achieved the highest mean average precision (0.189), while XGBoost with solicitation features achieved the highest mean ROC AUC (0.945). Adding solicitation features improved mean average precision for XGBoost and Random Forest, produced no observable improvement for Elastic Net at the reported precision, and reduced mean average precision for Logistic Regression. These findings indicate that the additional predictive value of solicitation-related information varies by algorithm. However, no model incorporating solicitation features outperformed baseline Logistic Regression in mean average precision.
 
-The next step is to integrate the solicitation features with the additional feature sets developed by the rest of the project team in a combined Group Modeling document. The combined models will then be evaluated using FY2025 predictor data and observed FY2026 conversion outcomes, which have been reserved for final validation. This evaluation will help determine whether the improvements observed during model development generalize to previously unseen data and identify the most effective model for predicting future major-donor conversions.
+The next step is to integrate the solicitation features with the additional feature sets developed by the rest of the project team in a combined Group Modeling document. Alternative algorithms and feature configurations will be compared using chronological validation within the development dataset. The selected model will then be evaluated using FY2025 predictor data and observed FY2026 conversion outcomes, which have been reserved for independent final validation. This evaluation will help determine whether the predictive performance observed during model development generalizes to previously unseen data.
 
 Ultimately, the objective is to provide PBS Utah with a reliable, data-driven approach to identifying promising major-donor prospects and prioritizing fundraising outreach.

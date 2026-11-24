@@ -32,3 +32,6 @@ passport_viewing.txt
 
 # Zip Folders
 *.zip
+
+# Presentation images
+*.png
