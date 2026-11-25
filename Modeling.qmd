@@ -31,16 +31,23 @@ This first stage is a descriptive analysis of four feature-year cohorts, **not**
 Load the required R packages and PBS Utah data sources, including constituent records, payments, soft credits, campaign activity, Passport viewing, and legacy gifts. Establish the $1,200 major-donor threshold and define FY2021–FY2024 as feature years, with FY2022–FY2025 serving as their corresponding outcome years. DuckDB is used to process the source files, and fiscal years are defined as July through June.
 
 ```{r}
-library(dplyr)
-library(tidyr)
-library(purrr)
+# Data manipulation and visualization
+library(tidyverse)
+library(scales)
+library(patchwork)
+library(gt)
+
+# Database management and file paths
 library(DBI)
 library(duckdb)
 library(here)
-library(scales)
-library(gt)
-library(lubridate)
-library(patchwork)
+
+# Predictive modeling and evaluation
+library(tidymodels)
+library(pROC)
+library(glmnet)
+library(ranger)
+library(xgboost)
 
 major_threshold <- 1200
 feature_years <- 2021:2024
@@ -500,15 +507,6 @@ dbDisconnect(con, shutdown = TRUE)
 Both populations are compared using the same four group-model benchmark predictors across two expanding-window chronological validation folds. Each fold uses at least two fiscal years of training data, with FY2023 and FY2024 serving as validation feature years. Training retains all positives and samples up to 50 negatives per positive. The population decision considers both average precision and how many future conversions remain eligible.
 
 ```{r modeling_setup}
-library(caret)
-library(readr)
-library(tibble)
-library(ggplot2)
-library(pROC)
-library(glmnet)
-library(randomForest)
-library(xgboost)
-
 options(tibble.print_max = Inf, tibble.width = Inf)
 RANDOM_SEED <- 42
 ```
@@ -586,10 +584,10 @@ stopifnot(all(baseline_features %in% names(dev)))
 ### Shared Training Preparation
 
 ```{r training_prep}
-prepare_features <- function(columns, train_data, valid_data, sampled_rows) {
+prepare_features <- function(columns, train_data, valid_data) {
 
   # Select the same predictors for training and validation
-  x_train <- train_data[sampled_rows, columns, drop = FALSE]
+  x_train <- train_data[, columns, drop = FALSE]
   x_valid <- valid_data[, columns, drop = FALSE]
 
   # Replace missing values using training medians
@@ -604,7 +602,7 @@ prepare_features <- function(columns, train_data, valid_data, sampled_rows) {
     x_valid[[column]][is.na(x_valid[[column]])] <- median_value
   }
 
-  # Remove predictors that are constant in the training sample
+  # Remove predictors that are constant in the training data
   varying <- vapply(
     x_train,
     function(x) length(unique(x)) > 1,
@@ -616,122 +614,189 @@ prepare_features <- function(columns, train_data, valid_data, sampled_rows) {
 
   list(train = x_train, valid = x_valid)
 }
-
-# Adjust predicted probabilities for the altered training class proportions
-correct_probability <- function(probability, population_prior, sample_prior) {
-  probability <- pmin(pmax(as.numeric(probability), 1e-8), 1 - 1e-8)
-
-  plogis(
-    qlogis(probability) +
-      qlogis(population_prior) -
-      qlogis(sample_prior)
-  )
-}
 ```
 
 
 
-### Four-Model Training Function (Used in Section 3)
+### Shared Model Training and Hyperparameter Tuning
 
 ```{r models}
-# Fixed model settings for benchmark comparisons
-control <- trainControl(
-  method = "none",
-  classProbs = TRUE,
-  allowParallel = FALSE
+algorithms <- c(
+  "Logistic Regression", "Random Forest",
+  "Elastic Net", "XGBoost"
 )
 
-fit_models <- function(x_train, x_valid, y_train) {
-
-  # Remove linearly dependent predictors for ordinary logistic regression
-  design <- cbind(Intercept = 1, as.matrix(x_train))
-  independent <- qr(design)$pivot[seq_len(qr(design)$rank)]
-  glm_columns <- setdiff(colnames(design)[independent], "Intercept")
-
-  # Logistic regression
-  set.seed(RANDOM_SEED)
-
-  logistic <- train(
-    x = x_train[, glm_columns, drop = FALSE],
-    y = y_train,
-    method = "glm",
-    family = binomial(),
-    trControl = control
-  )
-
-  # Elastic net logistic regression
-  set.seed(RANDOM_SEED)
-
-  elastic <- train(
-    x = x_train,
-    y = y_train,
-    method = "glmnet",
-    family = "binomial",
-    preProcess = c("center", "scale"),
-    tuneGrid = data.frame(
-      alpha = 0.5,
-      lambda = 0.01
+make_grid <- function(algorithm, p) {
+  switch(algorithm,
+    "Logistic Regression" = tibble(setting = 1L),
+    "Random Forest" = tidyr::crossing(
+      mtry = unique(pmax(1L, pmin(p, as.integer(c(
+        floor(sqrt(p)), floor(p / 3), floor(p / 2)
+      ))))),
+      min_n = c(5L, 20L)
     ),
-    trControl = control
-  )
-
-  # Random forest
-  set.seed(RANDOM_SEED)
-
-  forest <- train(
-    x = x_train,
-    y = y_train,
-    method = "rf",
-    ntree = 200,
-    tuneGrid = data.frame(
-      mtry = max(1, floor(sqrt(ncol(x_train))))
+    "Elastic Net" = tidyr::crossing(
+      penalty = c(0.0001, 0.001, 0.01, 0.1),
+      mixture = c(0, 0.5, 1)
     ),
-    trControl = control
+    "XGBoost" = tidyr::crossing(
+      tree_depth = c(2L, 4L),
+      learn_rate = c(0.03, 0.1),
+      min_n = c(5L, 20L)
+    )
   )
+}
 
-  # XGBoost
-  set.seed(RANDOM_SEED)
-
-  boost <- xgboost::xgb.train(
-    data = xgboost::xgb.DMatrix(
-      as.matrix(x_train),
-      label = as.integer(y_train == "yes")
-    ),
-    params = list(
-      objective = "binary:logistic",
-      max_depth = 3,
-      eta = 0.05,
-      colsample_bytree = 0.8,
-      subsample = 0.8,
-      nthread = 1
-    ),
-    nrounds = 100,
-    verbose = 0
+make_spec <- function(algorithm, params, p) {
+  switch(algorithm,
+    "Logistic Regression" = logistic_reg(mode = "classification") |>
+      set_engine("glm"),
+    "Random Forest" = rand_forest(
+      trees = 500L,
+      mtry = min(as.integer(params$mtry), p),
+      min_n = as.integer(params$min_n)
+    ) |> set_engine("ranger", probability = TRUE, num.threads = 1) |>
+      set_mode("classification"),
+    "Elastic Net" = logistic_reg(
+      penalty = params$penalty,
+      mixture = params$mixture
+    ) |> set_engine("glmnet") |> set_mode("classification"),
+    "XGBoost" = boost_tree(
+      trees = 300L,
+      tree_depth = as.integer(params$tree_depth),
+      learn_rate = params$learn_rate,
+      min_n = as.integer(params$min_n),
+      sample_size = 0.8,
+      mtry = p
+    ) |> set_engine("xgboost", nthread = 1) |>
+      set_mode("classification")
   )
+}
 
-  # Predict probabilities on the full validation population
+# Tie-aware expected number of conversions in a top-k list.
+top_k_metrics <- function(truth, scores, k) {
+  k <- min(as.integer(k), length(scores))
+  cutoff <- sort(scores, decreasing = TRUE)[k]
+  above <- scores > cutoff
+  tied <- scores == cutoff
+  slots <- k - sum(above)
+  captured <- sum(truth[above] == "yes") +
+    slots * mean(truth[tied] == "yes")
+  tibble(
+    k = k,
+    captured = captured,
+    precision = captured / k,
+    recall = captured / sum(truth == "yes"),
+    lift = (captured / k) / mean(truth == "yes")
+  )
+}
+
+score_predictions <- function(truth, scores) {
+  stopifnot(
+    length(truth) == length(scores),
+    !anyNA(scores),
+    all(is.finite(scores)),
+    all(scores >= 0 & scores <= 1),
+    sum(truth == "yes") > 0,
+    sum(truth == "no") > 0
+  )
+  k_results <- purrr::map_dfr(c(100L, 250L, 500L), function(k) {
+    top_k_metrics(truth, scores, k)
+  })
+  tibble(
+    n_validation = length(scores),
+    conversions = sum(truth == "yes"),
+    average_precision = yardstick::average_precision_vec(
+      truth, scores, event_level = "first"
+    ),
+    roc_auc = yardstick::roc_auc_vec(
+      truth, scores, event_level = "first"
+    ),
+    brier_score = mean((scores - as.integer(truth == "yes"))^2),
+    top_100_captured = k_results$captured[1],
+    top_250_captured = k_results$captured[2],
+    top_500_captured = k_results$captured[3],
+    top_500_precision = k_results$precision[3],
+    top_500_recall = k_results$recall[3],
+    top_500_lift = k_results$lift[3]
+  )
+}
+
+# Preprocess once per configuration/fold, then reuse the baked data for all settings.
+prepare_fold <- function(train, valid, predictors) {
+  train_data <- model_data(train, predictors)
+  valid_data <- model_data(valid, predictors)
+  rec <- prep(model_recipe(train, predictors), training = train_data)
+  train_baked <- bake(rec, new_data = NULL)
+  valid_baked <- bake(rec, new_data = valid_data)
+  p <- ncol(train_baked) - 1L
+  if (p < 1L) stop("No predictors remain after preprocessing")
+  list(train = train_baked, valid = valid_baked, p = p, recipe = rec)
+}
+
+fit_baked <- function(algorithm, params, baked, seed) {
+  set.seed(seed)
+
+  if (algorithm == "Elastic Net") {
+
+    # Use glmnet's regularization path
+    predictor_names <- setdiff(
+      names(baked$train),
+      "major_donor_next_fy"
+    )
+
+    x_train <- as.matrix(
+      baked$train[, predictor_names, drop = FALSE]
+    )
+
+    x_valid <- as.matrix(
+      baked$valid[, predictor_names, drop = FALSE]
+    )
+
+    y_train <- as.integer(
+      baked$train$major_donor_next_fy == "yes"
+    )
+
+    fitted <- glmnet::glmnet(
+      x = x_train,
+      y = y_train,
+      family = "binomial",
+      alpha = as.numeric(params$mixture),
+      standardize = FALSE
+    )
+
+    scores <- as.numeric(
+      predict(
+        fitted,
+        newx = x_valid,
+        s = as.numeric(params$penalty),
+        type = "response"
+      )
+    )
+
+  } else {
+
+    spec <- make_spec(algorithm, params, baked$p)
+
+    fitted <- parsnip::fit(
+      spec,
+      major_donor_next_fy ~ .,
+      data = baked$train
+    )
+
+    scores <- predict(
+      fitted,
+      new_data = baked$valid,
+      type = "prob"
+    )$.pred_yes
+  }
+
   list(
-    `Logistic Regression` = predict(
-      logistic,
-      x_valid[, glm_columns, drop = FALSE],
-      type = "prob"
-    )$yes,
-
-    `Elastic Net` = predict(
-      elastic,
-      x_valid,
-      type = "prob"
-    )$yes,
-
-    `Random Forest` = predict(
-      forest,
-      x_valid,
-      type = "prob"
-    )$yes,
-
-    XGBoost = predict(
-      boost,
-      xgboost::xgb.DMatrix(as.matrix(x_valid))
+    fit = fitted,
+    scores = scores,
+    metrics = score_predictions(
+      baked$valid$major_donor_next_fy,
+      scores
     )
   )
 }
@@ -846,15 +911,8 @@ baseline_predictions <- dplyr::bind_rows(lapply(seq_len(nrow(folds)), function(f
            fold, " for ", population)
     }
 
-    # Keep all positives and sample at most 50 negatives per positive.
-    set.seed(RANDOM_SEED + fold)
-    sampled_rows <- sort(c(
-      positive,
-      sample(negative, min(length(negative), 50L * length(positive)))
-    ))
-
     features <- prepare_features(
-      baseline_features, train_data, valid_data, sampled_rows
+      baseline_features, train_data, valid_data
     )
     if (ncol(features$train) == 0L) {
       stop("No varying baseline predictors in fold ", fold, " for ", population)
@@ -868,7 +926,7 @@ baseline_predictions <- dplyr::bind_rows(lapply(seq_len(nrow(folds)), function(f
 
     x_train <- as.data.frame(features$train[, glm_columns, drop = FALSE])
     x_valid <- as.data.frame(features$valid[, glm_columns, drop = FALSE])
-    x_train$outcome <- y_full[sampled_rows]
+    x_train$outcome <- y_full
 
     logistic_model <- stats::glm(
       outcome ~ ., data = x_train, family = stats::binomial()
@@ -877,9 +935,6 @@ baseline_predictions <- dplyr::bind_rows(lapply(seq_len(nrow(folds)), function(f
       logistic_model, newdata = x_valid, type = "response"
     ))
 
-    population_prior <- mean(y_full == 1L)
-    sample_prior <- mean(y_full[sampled_rows] == 1L)
-
     tibble(
       fold = fold,
       feature_year = folds$feature_year[fold],
@@ -887,9 +942,7 @@ baseline_predictions <- dplyr::bind_rows(lapply(seq_len(nrow(folds)), function(f
       population = population,
       model = "Logistic Regression",
       outcome = as.integer(valid_data$major_donor_next_fy),
-      probability = correct_probability(
-        raw_probability, population_prior, sample_prior
-      )
+      probability = raw_probability
     )
   }))
 }))
@@ -1302,15 +1355,15 @@ tibble(
 
 To determine the appropriate prospect population for predictive modeling, I compared two baseline logistic regression models using the same four predictors and chronological validation approach: one restricted to constituents with positive current-year giving and another including all eligible constituents, regardless of current-year giving activity.
 
-The positive-current-givers model achieved higher mean average precision and mean ROC AUC across the two shared validation folds. Mean average precision increased from 0.1026 to 0.1892, representing an approximately **84.41% relative improvement**, calculated as follows:
+The positive-current-givers model achieved higher mean average precision and mean ROC AUC across the two shared validation folds. Mean average precision increased from 0.1212 to 0.1919, representing an approximately **58.33% relative improvement**, calculated as follows:
 
 $$
 \text{Relative Improvement} =
-\frac{0.1892 - 0.1026}{0.1026} \times 100
-= 84.41\%
+\frac{0.1919 - 0.1212}{0.1212} \times 100
+= 58.33\%
 $$
 
-Mean ROC AUC also increased from 0.9260 to 0.9404, while the mean Brier score increased from 0.000254 to 0.001106.
+Mean ROC AUC also increased from 0.9265 to 0.9405, while the mean Brier score increased from 0.000249 to 0.001115.
 
 Although these results favor the positive-current-givers model in terms of ranking performance, both average precision and Brier score are influenced by the underlying conversion rate, which differs between the two prospect populations. Therefore, the comparison must also consider the proportion of future major-donor conversions retained. As demonstrated in the prospect coverage analysis, restricting the population to constituents with positive current-year giving reduces the eligible prospect pool by approximately 79.2% while retaining 91.3% of historically observed conversions.
 
@@ -1320,7 +1373,9 @@ Based on these findings, I selected constituents with positive current-year givi
 
 **Question:** Within the population selected in Section 2, do the 23 solicitation features improve performance beyond the four group-model benchmark predictors?
 
-The two predictor sets are trained and validated on identical selected-population observations and temporal folds. Campaign response indicators are observational proxies, not causal evidence of outreach effectiveness.
+The two predictor sets are trained and validated on identical selected-population observations and chronological validation folds. Model preprocessing, hyperparameter grids, training procedures, and evaluation metrics are consistent with those used in the Group Modeling document. The best hyperparameter configuration for each algorithm and predictor set is selected based on mean average precision across the two development validation folds.
+
+Campaign response indicators are observational proxies, not causal evidence of outreach effectiveness.
 
 ### Solicitation Features
 
@@ -1361,8 +1416,24 @@ dev <- dev |>
 # Zero exposures and response counts for constituents without campaign rows.
 count_features <- setdiff(solicitation_columns,
                           c("campaign_response_rate", "trailing_3_fy_response_rate", "campaign_code_link_rate"))
+first_modern_fy <- 2021L
+
 dev <- dev |>
-  mutate(across(all_of(count_features), ~coalesce(.x, 0)))
+  mutate(
+    across(all_of(count_features), ~coalesce(.x, 0)),
+
+    prior_fy_solicitations = if_else(
+      fiscal_year == first_modern_fy,
+      NA_real_,
+      as.numeric(prior_fy_solicitations)
+    ),
+
+    prior_fy_campaign_responses = if_else(
+      fiscal_year == first_modern_fy,
+      NA_real_,
+      as.numeric(prior_fy_campaign_responses)
+    )
+  )
 
 stopifnot(nrow(dev) == nrow(dev_panel),
           !anyDuplicated(dev[c("constituent_id", "fiscal_year")]),
@@ -1393,116 +1464,296 @@ modeling_data <- if (selected_population == "positive_current_givers") {
 stopifnot(all(c(baseline_features, solicitation_columns) %in% names(modeling_data)))
 ```
 
-```{r predictions}
-predictions <- bind_rows(lapply(seq_len(nrow(folds)), function(fold) {
+```{r}
+library(tidymodels)
+library(glmnet)
+library(ranger)
+library(xgboost)
+library(rpart)
 
-  # Select training and validation years
-  train_data <- modeling_data %>%
-    filter(fiscal_year < folds$feature_year[fold])
+# Use the same feature configuration identifiers as the group.
+feature_configs <- list(
+  A = baseline_features,
+  C = c(baseline_features, solicitation_columns)
+)
 
-  valid_data <- modeling_data %>%
-    filter(fiscal_year == folds$feature_year[fold])
+feature_configs <- lapply(feature_configs, unique)
 
-  # Identify positive and negative training observations
-  y_full <- train_data$major_donor_next_fy
+config_labels <- c(
+  A = "without_solicitation",
+  C = "with_solicitation"
+)
 
-  positive <- which(y_full == 1)
-  negative <- which(y_full == 0)
+# Apply the same logarithmic transformation to solicitation counts.
+# Rate predictors remain untransformed.
+log1p_predictors <- setdiff(
+  solicitation_columns,
+  c(
+    "campaign_response_rate",
+    "trailing_3_fy_response_rate",
+    "campaign_code_link_rate"
+  )
+)
 
-  # Keep every positive and sample up to 50 negatives per positive
-  set.seed(RANDOM_SEED + fold)
-
-  sampled_rows <- sort(c(
-    positive,
-    sample(
-      negative,
-      min(length(negative), 50L * length(positive))
+model_data <- function(data, predictors) {
+  data |>
+    select(major_donor_next_fy, all_of(predictors)) |>
+    mutate(
+      major_donor_next_fy = factor(
+        if_else(major_donor_next_fy == 1, "yes", "no"),
+        levels = c("yes", "no")
+      )
     )
-  ))
+}
 
-  # Create training outcome
-  y_train <- factor(
-    ifelse(y_full[sampled_rows] == 1, "yes", "no"),
-    levels = c("yes", "no")
+model_recipe <- function(data, predictors) {
+
+  rec <- recipe(
+    major_donor_next_fy ~ .,
+    data = model_data(data, predictors)
   )
 
-  # Verify both outcome classes are represented
-  stopifnot(all(table(y_train) > 0))
+  to_log <- intersect(predictors, log1p_predictors)
 
-  # Calculate class proportions for probability correction
-  population_prior <- mean(y_full == 1)
-  sample_prior <- mean(y_full[sampled_rows] == 1)
+  if (length(to_log)) {
+    rec <- rec |>
+      step_log(all_of(to_log), offset = 1)
+  }
 
-  # Compare models with and without solicitation features
-  bind_rows(lapply(names(feature_sets), function(feature_set) {
-
-    features <- prepare_features(
-      feature_sets[[feature_set]],
-      train_data,
-      valid_data,
-      sampled_rows
-    )
-
-    # Fit four models and predict validation outcomes
-    scores <- fit_models(
-      features$train,
-      features$valid,
-      y_train
-    )
-
-    # Store predictions for each model
-    bind_rows(lapply(seq_along(scores), function(i) {
-
-      model_name <- names(scores)[i]
-      corrected <- correct_probability(
-        scores[[i]],
-        population_prior,
-        sample_prior
-      )
-
-      tibble(
-        fold = fold,
-        feature_year = folds$feature_year[fold],
-        outcome_year = folds$outcome_year[fold],
-        model = model_name,
-        feature_set = feature_set,
-        outcome = valid_data$major_donor_next_fy,
-        probability = corrected
-      )
-    }))
-  }))
-}))
+  rec |>
+    step_string2factor(all_nominal_predictors()) |>
+    step_unknown(all_nominal_predictors()) |>
+    step_novel(all_nominal_predictors()) |>
+    step_impute_median(all_numeric_predictors()) |>
+    step_dummy(all_nominal_predictors()) |>
+    step_zv(all_predictors()) |>
+    step_normalize(all_numeric_predictors())
+}
 ```
 
+```{r predictions}
 
-```{r solicitation_evaluation}
-comparison <- predictions |>
-  group_by(fold, feature_year, outcome_year, model, feature_set) |>
-  group_modify(~ score_model(.x)) |>
-  ungroup()
+# Reproduce the full group task structure to preserve random seeds.
+group_algorithms <- c(
+  "Logistic Regression",
+  "Decision Tree",
+  "Random Forest",
+  "Elastic Net",
+  "XGBoost"
+)
+
+group_tasks <- tidyr::crossing(
+  algorithm = group_algorithms,
+  configuration = c("A", "B", "C", "D", "E")
+) |>
+  mutate(task_id = row_number())
+
+# Retain only the eight combinations relevant to this analysis.
+model_tasks <- group_tasks |>
+  filter(
+    algorithm != "Decision Tree",
+    configuration %in% c("A", "C")
+  )
+
+stopifnot(nrow(model_tasks) == 8L)
+
+# Use the same chronological validation years.
+validation_years <- folds$feature_year
+
+# Evaluate each algorithm and feature configuration.
+task_results <- lapply(seq_len(nrow(model_tasks)), function(i) {
+
+  task <- model_tasks[i, ]
+
+  algorithm <- task$algorithm[[1]]
+  config <- task$configuration[[1]]
+  task_id <- task$task_id[[1]]
+
+  predictors <- feature_configs[[config]]
+
+  # Preprocess each chronological fold once.
+  baked_folds <- lapply(validation_years, function(vy) {
+
+    prepare_fold(
+      train = modeling_data |>
+        filter(fiscal_year < vy),
+      valid = modeling_data |>
+        filter(fiscal_year == vy),
+      predictors = predictors
+    )
+  })
+
+  # Use the same candidate hyperparameter grid as the group.
+  grid <- make_grid(
+    algorithm,
+    min(vapply(baked_folds, `[[`, integer(1), "p"))
+  )
+
+  grid$candidate_id <- seq_len(nrow(grid))
+
+  fold_metrics <- vector(
+    "list",
+    nrow(grid) * length(validation_years)
+  )
+
+  counter <- 0L
+
+  # Evaluate every hyperparameter setting on both folds.
+  for (candidate_id in seq_len(nrow(grid))) {
+
+    params <- as.list(
+      grid[candidate_id, , drop = FALSE]
+    )
+
+    for (fold_id in seq_along(validation_years)) {
+
+      counter <- counter + 1L
+
+      # Preserve the original group-model random seed.
+      seed <- 42L +
+        task_id * 10000L +
+        candidate_id * 100L +
+        fold_id
+
+      output <- fit_baked(
+        algorithm,
+        params,
+        baked_folds[[fold_id]],
+        seed
+      )
+
+      fold_metrics[[counter]] <- output$metrics |>
+        mutate(
+          algorithm = algorithm,
+          configuration = config,
+          candidate_id = candidate_id,
+          fold = fold_id,
+          validation_year = validation_years[[fold_id]],
+          .before = 1
+        )
+    }
+  }
+
+  list(
+    grid = grid |>
+      mutate(
+        algorithm = algorithm,
+        configuration = config,
+        .before = 1
+      ),
+    fold_metrics = bind_rows(fold_metrics)
+  )
+})
+
+# Combine candidate settings and validation results.
+candidate_grid <- bind_rows(
+  lapply(task_results, `[[`, "grid")
+)
+
+fold_results <- bind_rows(
+  lapply(task_results, `[[`, "fold_metrics")
+)
+
+# Summarize performance across chronological validation folds.
+candidate_comparison <- fold_results |>
+  group_by(algorithm, configuration, candidate_id) |>
+  summarise(
+    mean_average_precision = mean(average_precision),
+    min_average_precision = min(average_precision),
+    max_average_precision = max(average_precision),
+    ap_range = max(average_precision) -
+      min(average_precision),
+    mean_roc_auc = mean(roc_auc),
+    mean_brier_score = mean(brier_score),
+    mean_top_100_captured = mean(top_100_captured),
+    mean_top_250_captured = mean(top_250_captured),
+    mean_top_500_captured = mean(top_500_captured),
+    folds = n(),
+    .groups = "drop"
+  )
+
+# Confirm every candidate was evaluated on both folds.
+stopifnot(
+  all(candidate_comparison$folds == 2L),
+  nrow(fold_results) == 2L * nrow(candidate_grid)
+)
+
+# Select the best hyperparameter setting for each combination.
+# Apply the same ranking and tie-breaking rules as the group.
+comparison <- candidate_comparison |>
+  arrange(
+    desc(mean_average_precision),
+    mean_brier_score,
+    ap_range,
+    candidate_id
+  ) |>
+  group_by(algorithm, configuration) |>
+  slice(1) |>
+  ungroup() |>
+  arrange(
+    desc(mean_average_precision),
+    mean_brier_score,
+    ap_range,
+    algorithm,
+    configuration
+  ) |>
+  mutate(
+    feature_set = unname(config_labels[configuration]),
+    .after = configuration
+  )
+
+# Retain selected hyperparameters for reproducibility.
+selected_settings <- comparison |>
+  select(
+    algorithm,
+    configuration,
+    feature_set,
+    candidate_id
+  ) |>
+  left_join(
+    candidate_grid,
+    by = c(
+      "algorithm",
+      "configuration",
+      "candidate_id"
+    )
+  )
+
+stopifnot(nrow(comparison) == 8L)
+
 ```
 
 ### Performance Comparison
 
 ```{r model-comparison}
 # Summarize performance across validation folds
-model_summary <- comparison %>%
-  group_by(model, feature_set) %>%
-  summarise(
-    mean_ap = mean(average_precision, na.rm = TRUE),
-    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
-    mean_brier = mean(brier, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
+model_summary <- comparison |>
+  transmute(
+    model = algorithm,
+    feature_set = feature_set,
+    mean_ap = mean_average_precision,
+    mean_roc_auc = mean_roc_auc,
+    mean_brier = mean_brier_score
+  ) |>
   arrange(desc(mean_ap))
 
-# Display model comparison
-model_summary %>%
-  gt() %>%
+model_summary |>
+  gt() |>
+  tab_header(
+    title = "Solicitation Feature Performance Comparison",
+    subtitle = "Two chronological validation folds"
+  ) |>
+  cols_label(
+    model = "Model",
+    feature_set = "Feature Set",
+    mean_ap = "Mean Average Precision",
+    mean_roc_auc = "Mean ROC AUC",
+    mean_brier = "Mean Brier Score"
+  ) |>
   fmt_number(
     columns = c(mean_ap, mean_roc_auc),
-    decimals = 3
-  ) %>%
+    decimals = 4
+  ) |>
   fmt_number(
     columns = mean_brier,
     decimals = 6
@@ -1541,13 +1792,142 @@ best_models %>%
   fmt_number(columns = value, decimals = 4)
 ```
 
+$$
+\text{Relative Improvement} =
+\frac{0.1940 - 0.1919}{0.1919} \times 100
+= 1.09\%
+$$
+
+### Feature Importance
+
+```{r}
+# Identify the selected Elastic Net hyperparameters
+elastic_settings <- selected_settings |>
+  filter(
+    algorithm == "Elastic Net",
+    feature_set == "with_solicitation"
+  )
+
+stopifnot(nrow(elastic_settings) == 1L)
+
+# Identify selected predictors
+selected_predictors <- feature_configs[[
+  elastic_settings$configuration[[1]]
+]]
+
+# Prepare the complete development dataset
+importance_recipe <- prep(
+  model_recipe(modeling_data, selected_predictors),
+  training = model_data(modeling_data, selected_predictors)
+)
+
+importance_data <- bake(
+  importance_recipe,
+  new_data = NULL
+)
+
+# Separate predictors and outcome
+x_train <- importance_data |>
+  select(-major_donor_next_fy) |>
+  as.matrix()
+
+y_train <- as.integer(
+  importance_data$major_donor_next_fy == "yes"
+)
+
+# Refit Elastic Net using selected hyperparameters
+set.seed(RANDOM_SEED)
+
+importance_model <- glmnet::glmnet(
+  x = x_train,
+  y = y_train,
+  family = "binomial",
+  alpha = elastic_settings$mixture[[1]],
+  standardize = FALSE
+)
+
+# Extract coefficients at the selected penalty
+coefficients <- as.matrix(
+  coef(
+    importance_model,
+    s = elastic_settings$penalty[[1]]
+  )
+)
+
+# Construct feature importance table
+feature_importance <- tibble(
+  predictor = rownames(coefficients),
+  coefficient = as.numeric(coefficients[, 1])
+) |>
+  filter(predictor != "(Intercept)") |>
+  mutate(
+    importance = abs(coefficient),
+    direction = case_when(
+      coefficient > 0 ~ "Positive",
+      coefficient < 0 ~ "Negative",
+      TRUE ~ "Zero"
+    ),
+    feature_set = if_else(
+      predictor %in% baseline_features,
+      "Baseline",
+      "Solicitation"
+    )
+  ) |>
+  arrange(desc(importance))
+```
+
+```{r}
+feature_importance |>
+  filter(coefficient != 0) |>
+  mutate(
+    predictor = forcats::fct_reorder(
+      predictor,
+      coefficient
+    )
+  ) |>
+  ggplot(
+    aes(
+      x = coefficient,
+      y = predictor,
+      fill = direction
+    )
+  ) +
+  geom_col(width = 0.75) +
+  geom_vline(
+    xintercept = 0,
+    color = "gray40"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Positive" = "#198754",
+      "Negative" = "#DC3545"
+    )
+  ) +
+  labs(
+    title = "Elastic Net Feature Importance",
+    subtitle = "Baseline and solicitation predictors",
+    x = "Standardized Coefficient",
+    y = NULL,
+    fill = "Association",
+    caption = "Model refitted using FY2021–FY2024 development data."
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
 ### Conclusions
 
 This analysis evaluated the appropriate prospect population and the predictive value of solicitation-related features for identifying constituents likely to become major donors in the following fiscal year.
 
-The prospect pool analysis demonstrated that constituents with positive current-year giving were substantially more likely to reach the $1,200 major-donor threshold than constituents with no recognized giving. Restricting the population to current donors reduced the eligible prospect pool by approximately 79.2% while retaining 91.3% of historically observed major-donor conversions. The baseline logistic regression comparison further supported this decision, with mean average precision increasing from 0.1026 to 0.1892, representing an approximately 84.41% relative improvement. Based on these findings, I selected constituents with recognized giving greater than $0 but less than $1,200 in the feature fiscal year as the population for subsequent modeling.
+The prospect pool analysis demonstrated that constituents with positive current-year giving were substantially more likely to reach the $1,200 major-donor threshold than constituents with no recognized giving. Restricting the population to current donors reduced the eligible prospect pool by approximately 79.2% while retaining 91.3% of historically observed major-donor conversions. The baseline Logistic Regression comparison further supported this decision, with mean average precision increasing from 0.1212 to 0.1919, representing an approximately 58.33% relative improvement. Based on these findings, I selected constituents with recognized giving greater than $0 but less than $1,200 in the feature fiscal year as the population for subsequent modeling.
 
-I then evaluated whether adding 23 solicitation-related features to the four baseline predictors improved model performance. Among the models evaluated, Logistic Regression without solicitation features achieved the highest mean average precision (0.189), while XGBoost with solicitation features achieved the highest mean ROC AUC (0.945). Adding solicitation features improved mean average precision for XGBoost and Random Forest, produced no observable improvement for Elastic Net at the reported precision, and reduced mean average precision for Logistic Regression. These findings indicate that the additional predictive value of solicitation-related information varies by algorithm. However, no model incorporating solicitation features outperformed baseline Logistic Regression in mean average precision.
+I then evaluated whether adding 23 solicitation-related features to the four baseline predictors improved model performance. Among the models evaluated, Elastic Net with solicitation features achieved both the highest mean average precision (0.1940) and the highest mean ROC AUC (0.9461), while XGBoost without solicitation features achieved the lowest mean Brier score (0.0011).
+
+Compared with the reference Logistic Regression model using only the baseline predictors, Elastic Net with solicitation features achieved an approximately 1.09% relative improvement in mean average precision. These findings suggest that solicitation-related information may provide additional predictive value when combined with an appropriate modeling algorithm and regularization strategy. However, the relatively modest improvement indicates that historical giving information remains an important foundation for predicting major-donor conversion.
 
 The next step is to integrate the solicitation features with the additional feature sets developed by the rest of the project team in a combined Group Modeling document. Alternative algorithms and feature configurations will be compared using chronological validation within the development dataset. The selected model will then be evaluated using FY2025 predictor data and observed FY2026 conversion outcomes, which have been reserved for independent final validation. This evaluation will help determine whether the predictive performance observed during model development generalizes to previously unseen data.
 
